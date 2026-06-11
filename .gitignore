@@ -1,0 +1,65 @@
+# =============================================================================
+# .gitignore — PPQFL Breast Cancer Screening
+# =============================================================================
+
+# ── Generated outputs ────
+outputs/
+
+# ── Raw datasets ─────────────────
+data/
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.conda/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Model checkpoints ─────────
+*.pt
+*.pth
+*.ckpt
+*.pkl
+
+# ── NumPy feature arrays ───────────────────
+*.npy
+
+# ── Pipeline cache ────────────────────────────────────────────────────────────
+.pipeline_cache.json
+.rename_backup/
+.path_backup
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+pipeline_logs/
+*.log
+nohup.out
+
+# ── OS / editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Sensitive / local config ─────────────────────────────────────────────────
+.env
+secrets.yaml
+*_private*
+
+# ── Miscellaneous ─────────────────────────────────────────────
+run_commands.txt
