@@ -1,6 +1,6 @@
 """
 =============================================================================
-WEEK 2A — CLASSICAL BASELINE: MobileNetV2 FINE-TUNING ON MENDELEY DATASET
+2A — CLASSICAL BASELINE: MobileNetV2 FINE-TUNING ON MENDELEY DATASET
 =============================================================================
 Project : Quantum-Enhanced Hybrid Architectures for Mammographic Breast
           Cancer Classification in African and MENA Populations
@@ -10,8 +10,7 @@ Purpose : Train a MobileNetV2 (ImageNet pretrained) binary classifier on the
             (1) The classical performance ceiling for comparison against HQCNN
             (2) The pretrained backbone whose penultimate-layer features will
                 be fed into the quantum VQC pipeline (2b_feature_pca.py)
-Environment: Kaggle GPU (T4 x2)
-Output:   /home/derrick/Projects/QFL_breast_cancer_screening/outputs/baseline_outputs/
+Output:   ../ppqfl-breast-cancer-screening/outputs/baseline_outputs/
             mobilenetv2_best.pt       ← best checkpoint (val AUC)
             mobilenetv2_final.pt      ← final epoch checkpoint
             training_history.csv      ← per-epoch metrics
@@ -29,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')  # non-interactive, writes files only — no display needed
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 from PIL import Image
@@ -50,24 +49,26 @@ from sklearn.metrics import (
     confusion_matrix, classification_report, roc_curve
 )
 
+from pipeline_utils import seed_everything
+
 warnings.filterwarnings("ignore")
-torch.manual_seed(42)
-np.random.seed(42)
+seed_everything(42)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 0.  CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Dataset paths (same as 1_eda.py — adjust if needed) ─────────────────
-ROOT_MENDELEY       = Path("/data/derrick/mendeley/Breast Cancer Dataset/Breast Cancer Original")
+ROOT_MENDELEY      = Path("/data/derrick/mendeley/Breast Cancer Dataset/Breast Cancer Original")
 MENDELEY_BENIGN    = ROOT_MENDELEY / "Benign"
-MENDELEY_MALIGNANT = ROOT_MENDELEY / "Malignant"
+MENDELEY_MALIGNANT = ROOT_MENDELEYf / "Malignant"
 
-# ── Load split indices saved by 1_eda.py (for reproducibility) ──────────
-SPLIT_INDEX_FILE = Path("/home/derrick/Projects/QFL_breast_cancer_screening/outputs/eda_outputs/mendeley_split_indices.json")
+# ── Load split indices saved by _1_eda.py (for reproducibility) ──────────
+PROJECT_ROOT     = Path(__file__).resolve().parent
+BASE             = PROJECT_ROOT / "outputs"
+SPLIT_INDEX_FILE = BASE / "eda_outputs/mendeley_split_indices.json"
 
-# ── Output directory ─────────────────────────────────────────────────────────
-OUT_DIR = Path("/home/derrick/Projects/QFL_breast_cancer_screening/outputs/baseline_outputs")
+OUT_DIR          = BASE / "baseline_outputs"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -333,7 +334,7 @@ def plot_training_curves(history: pd.DataFrame):
 
     plt.tight_layout()
     plt.savefig(OUT_DIR / "training_curves.png", dpi=150, bbox_inches="tight")
-    # plt.show()  # disabled: headless server
+    # plt.show()
 
 
 def plot_confusion_matrix(y_true, y_pred, title="Test Set"):
@@ -347,7 +348,7 @@ def plot_confusion_matrix(y_true, y_pred, title="Test Set"):
     ax.set_title(f"Confusion Matrix — {title}\n{BACKBONE} Classical Baseline")
     plt.tight_layout()
     plt.savefig(OUT_DIR / "confusion_matrix.png", dpi=150, bbox_inches="tight")
-    # plt.show()  # disabled: headless server
+    # plt.show() 
 
 
 def plot_roc_curve(y_true, y_probs):
@@ -365,7 +366,7 @@ def plot_roc_curve(y_true, y_probs):
     ax.legend(loc="lower right")
     plt.tight_layout()
     plt.savefig(OUT_DIR / "roc_curve.png", dpi=150, bbox_inches="tight")
-    # plt.show()  # disabled: headless server
+    # plt.show()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -374,7 +375,7 @@ def plot_roc_curve(y_true, y_probs):
 
 def main():
     print("═"*70)
-    print(f"  WEEK 2A — {BACKBONE} CLASSICAL BASELINE")
+    print(f"  2A — {BACKBONE} CLASSICAL BASELINE")
     print("  QML Breast Cancer Classification | Mendeley Dataset")
     print("═"*70)
 

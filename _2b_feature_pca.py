@@ -1,6 +1,6 @@
 """
 =============================================================================
-WEEK 2B — FEATURE EXTRACTION + PCA: BRIDGE TO THE QUANTUM PIPELINE
+2B — FEATURE EXTRACTION + PCA: BRIDGE TO THE QUANTUM PIPELINE
 =============================================================================
 Project : Quantum-Enhanced Hybrid Architectures for Mammographic Breast
           Cancer Classification in African and MENA Populations
@@ -8,7 +8,7 @@ Purpose : Extract penultimate-layer features from the trained MobileNetV2
           backbone, apply PCA to reduce dimensionality to the quantum-
           feasible range (4–8 components), and validate that the compressed
           features retain class separability.
-          This is the direct input to the VQC in Phase 3 (Week 3–5).
+          This is the direct input to the VQC in Phase 3 (3–5).
 
 Pipeline:
   MobileNetV2 (frozen, best checkpoint)
@@ -17,8 +17,8 @@ Pipeline:
     → 4 / 6 / 8 principal components
     → Saved as .npy arrays ready for quantum encoding
 
-Environment: Kaggle GPU (T4 x2)
-Outputs (/home/derrick/Projects/QFL_breast_cancer_screening/outputs/feature_outputs/):
+Environment:
+Outputs (../ppqfl-breast-cancer-screening/outputs/feature_outputs/):
   features_train_raw.npy   ← 2048-dim raw features, training split
   features_val_raw.npy
   features_test_raw.npy
@@ -45,7 +45,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')  # non-interactive, writes files only — no display needed
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import seaborn as sns
@@ -64,22 +64,20 @@ from sklearn.manifold import TSNE
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, accuracy_score
 
+from pipeline_utils import seed_everything
+
 warnings.filterwarnings("ignore")
-torch.manual_seed(42)
-np.random.seed(42)
+seed_everything(42)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 0.  CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Dataset paths ────────────────────────────────────────────────────────────
 ROOT_MENDELEY      = Path("/data/derrick/mendeley/Breast Cancer Dataset/Breast Cancer Original")
-#ROOT_MENDELEY      = Path("/kaggle/input/datasets/armstrong67/mendeley-mammogram-image-dataset/Mammogram Image Dataset for Breast Cancer Detectio/Breast Cancer Dataset/Breast Cancer Original")
 MENDELEY_BENIGN    = ROOT_MENDELEY / "Benign"
 MENDELEY_MALIGNANT = ROOT_MENDELEY / "Malignant"
 
 ROOT_KAU = Path("/data/derrick/kau")
-# BI-RADS binarisation: 1,3 → Benign (0); 4,5 → Malignant (1)
 KAU_BIRAD_MAP = {
     0: [ROOT_KAU / "BIRAD1" / "b1",
         ROOT_KAU / "Birad3" / "b3"],
@@ -89,13 +87,16 @@ KAU_BIRAD_MAP = {
 KAU_BENIGN    = KAU_BIRAD_MAP[0][0]
 KAU_MALIGNANT = KAU_BIRAD_MAP[1][0]
 
-# ── Match this to BACKBONE in 2a_baseline.py ──────────────────────────────
+PROJECT_ROOT  = Path(__file__).resolve().parent
+BASE          = PROJECT_ROOT / "outputs"
+
+# ── Match this to BACKBONE in _2a_baseline.py ──────────────────────────────
 BACKBONE         = "mobilenetv2"   # "mobilenetv2" | "resnet50" | "efficientnet_b0"
-BEST_CHECKPOINT  = Path(f"/home/derrick/Projects/QFL_breast_cancer_screening/outputs/baseline_outputs/{BACKBONE}_best.pt")
-SPLIT_INDEX_FILE = Path("/home/derrick/Projects/QFL_breast_cancer_screening/outputs/eda_outputs/mendeley_split_indices.json")
+BEST_CHECKPOINT  = BASE / "baseline_outputs/{BACKBONE}_best.pt"
+SPLIT_INDEX_FILE = BASE / "eda_outputs/mendeley_split_indices.json"
 
 # ── Output ───────────────────────────────────────────────────────────────────
-OUT_DIR = Path("/home/derrick/Projects/QFL_breast_cancer_screening/outputs/feature_outputs")
+OUT_DIR          = BASE / "feature_outputs"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── PCA components to evaluate — the quantum pipeline will use these ─────────
@@ -445,7 +446,7 @@ def check_encoding_range(features_pca: np.ndarray, n_components: int):
     if mins.min() < -1.0 or maxes.max() > 1.0:
         print("    [!] Features exceed [-1, 1] range.")
         print("    → Apply MinMaxScaler to [0, 1] BEFORE angle encoding in the VQC pipeline.")
-        print("    → This is already included in week3_vqc.py preprocessing.")
+        print("    → This is already included in 3_vqc.py preprocessing.")
     else:
         print("    ✓ Features within [-1, 1]. Angle encoding safe to apply directly.")
 
@@ -456,7 +457,7 @@ def check_encoding_range(features_pca: np.ndarray, n_components: int):
 
 def main():
     print("═"*70)
-    print("  WEEK 2B — FEATURE EXTRACTION + PCA")
+    print("  2B — FEATURE EXTRACTION + PCA")
     print("  QML Breast Cancer Classification | Bridge to Quantum Pipeline")
     print("═"*70)
 
@@ -593,7 +594,7 @@ def main():
     print("═"*70)
     print("  FEATURE EXTRACTION + PCA COMPLETE")
     print("  Outputs saved to:", OUT_DIR)
-    print("\n  Files ready for quantum pipeline (week3_vqc.py):")
+    print("\n  Files ready for quantum pipeline (3_vqc.py):")
     for n in PCA_N_COMPONENTS:
         cv = pca_report[n]["cumulative_variance"] * 100
         pr = probe_results[n]["val_auc"]

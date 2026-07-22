@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run_pipeline.sh — Full QML Pipeline Orchestrator
+# run_pipeline.sh — Full QFL Pipeline Orchestrator
 # =============================================================================
 # Project : Privacy-Preserving Quantum Federated Learning for Breast Cancer
 #           Screening in African and MENA Populations
@@ -14,8 +14,8 @@
 #   ./run_pipeline.sh --skip-slow      # minimal VQC sweep (full by default)
 #
 # Stage names (use exactly these strings with --from / --only):
-#   1_eda  2a_baseline  2b_feature_pca  3_5_vqc
-#   6_7_uq  8_9_qfl  10_11_external_val
+#   _1_eda  _2a_baseline  _2b_feature_pca  _3_5_vqc
+#   _6_7_uq  _8_9_qfl  _10_11_external_val
 # =============================================================================
 
 # NOTE: pipefail is intentionally NOT set globally — tee pipes would cause
@@ -30,33 +30,33 @@ MASTER_LOG="${LOG_DIR}/pipeline_${TIMESTAMP}.log"
 
 # ── Stage definitions (order matters) ────────────────────────────────────────
 declare -a STAGES=(
-    "1_eda"
-    "2a_baseline"
-    "2b_feature_pca"
-    "3_5_vqc"
-    "6_7_uq"
-    "8_9_qfl"
-    "10_11_external_val"
+    "_1_eda"
+    "_2a_baseline"
+    "_2b_feature_pca"
+    "_3_5_vqc"
+    "_6_7_uq"
+    "_8_9_qfl"
+    "_10_11_external_val"
 )
 
 declare -A STAGE_SCRIPTS=(
-    ["1_eda"]="1_eda.py"
-    ["2a_baseline"]="2a_baseline.py"
-    ["2b_feature_pca"]="2b_feature_pca.py"
-    ["3_5_vqc"]="3_5_vqc.py"
-    ["6_7_uq"]="6_7_uq.py"
-    ["8_9_qfl"]="8_9_qfl.py"
-    ["10_11_external_val"]="10_11_external_val.py"
+    ["_1_eda"]="_1_eda.py"
+    ["_2a_baseline"]="_2a_baseline.py"
+    ["_2b_feature_pca"]="_2b_feature_pca.py"
+    ["_3_5_vqc"]="_3_5_vqc.py"
+    ["_6_7_uq"]="_6_7_uq.py"
+    ["_8_9_qfl"]="_8_9_qfl.py"
+    ["_10_11_external_val"]="_10_11_external_val.py"
 )
 
 declare -A STAGE_DESC=(
-    ["1_eda"]="1:     Data audit & EDA (Mendeley + KAU-BCMD)"
-    ["2a_baseline"]="2a:    Classical baseline (MobileNetV2 progressive fine-tuning)"
-    ["2b_feature_pca"]="2b:    Feature extraction + PCA (bridge to quantum)"
-    ["3_5_vqc"]="3-5:  VQC design, Regime A/B, hyperparameter sweep, noise robustness"
-    ["6_7_uq"]="6-7:  Uncertainty quantification (MC-Dropout + quantum shot variance)"
-    ["8_9_qfl"]="8-9:  Simulated Quantum Federated Learning (QFL) + DP trade-off"
-    ["10_11_external_val"]="10-11: External validation (KAU-BCMD) + master ablation table"
+    ["_1_eda"]="1:     Data audit & EDA (Mendeley + KAU-BCMD)"
+    ["_2a_baseline"]="2a:    Classical baseline (MobileNetV2 progressive fine-tuning)"
+    ["_2b_feature_pca"]="2b:    Feature extraction + PCA (bridge to quantum)"
+    ["_3_5_vqc"]="3-5:  VQC design, Regime A/B, hyperparameter sweep, noise robustness"
+    ["_6_7_uq"]="6-7:  Uncertainty quantification (MC-Dropout + quantum shot variance)"
+    ["_8_9_qfl"]="8-9:  Simulated Quantum Federated Learning (QFL) + DP trade-off"
+    ["_10_11_external_val"]="10-11: External validation (KAU-BCMD) + master ablation table"
 )
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
@@ -253,7 +253,7 @@ EOF
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 main() {
     log "═════════════════════════════════════════════════════════════════════════"
-    log "${BOLD}  QML Pipeline Orchestrator${NC}"
+    log "${BOLD}  QFL Pipeline Orchestrator${NC}"
     log "  Privacy-Preserving Quantum Federated Learning"
     log "  Breast Cancer Screening — African & MENA Populations"
     log "  Started: $(date)"
@@ -277,7 +277,7 @@ main() {
             else
                 failed_stages+=("$stage")
                 log_err "Pipeline halted at stage: $stage"
-                log_info "Resume: mkdir -p pipeline_logs && nohup bash run_pipeline.sh --from $stage > pipeline_logs/nohup_resume.log 2>&1 &"
+                log_info "Resume: mkdir -p pipeline_logs && nohup bash run_pipeline.sh --from $stage > pipeline_logs/nohup_resume.log 2>&1 & echo "PID: $!""
                 break
             fi
         else

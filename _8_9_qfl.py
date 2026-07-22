@@ -1,6 +1,6 @@
 """
 =============================================================================
-WEEKS 8–9 — SIMULATED QUANTUM FEDERATED LEARNING (QFL)
+8–9 — SIMULATED QUANTUM FEDERATED LEARNING (QFL)
 =============================================================================
 Project : Quantum-Enhanced Hybrid Architectures for Mammographic Breast
           Cancer Classification in African and MENA Populations
@@ -32,7 +32,7 @@ Privacy note:
   adding calibrated Gaussian noise to gradients (σ_dp configurable).
   This approximates the privacy-utility trade-off without real data.
 
-Outputs (/home/derrick/Projects/QFL_breast_cancer_screening/outputs/qfl_outputs/):
+Outputs (../ppqfl-breast-cancer-screening/outputs/qfl_outputs/):
   partition_summary.png        ← client data distributions (non-IID viz)
   federated_training.csv       ← per-round global metrics
   federated_vs_centralised.png ← key comparison plot
@@ -42,7 +42,7 @@ Outputs (/home/derrick/Projects/QFL_breast_cancer_screening/outputs/qfl_outputs/
 
 Prerequisites:
   pip install flwr pennylane torch scikit-learn
-  3_5_vqc.py must have completed (best Regime A checkpoint used as
+  _3_5_vqc.py must have completed (best Regime A checkpoint used as
   warm-start initialisation for federated VQC).
 =============================================================================
 """
@@ -81,20 +81,24 @@ from flwr.server.client_proxy import ClientProxy
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
 
+from pipeline_utils import seed_everything
+
 warnings.filterwarnings("ignore")
-torch.manual_seed(42)
-np.random.seed(42)
+seed_everything(42)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 0.  CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-FEAT_DIR     = Path("/home/derrick/Projects/QFL_breast_cancer_screening/outputs/feature_outputs")
-VQC_CKPT_DIR = Path("/home/derrick/Projects/QFL_breast_cancer_screening/outputs/vqc_outputs/regime_A")
-OUT_DIR      = Path("/home/derrick/Projects/QFL_breast_cancer_screening/outputs/qfl_outputs")
+PROJECT_ROOT = Path(__file__).resolve().parent
+BASE         = PROJECT_ROOT / "outputs"
+FEAT_DIR     = BASE / "feature_outputs"
+VQC_CKPT_DIR = BASE / "vqc_outputs/regime_A"        # base dir — subdirs appended per regime
+OUT_DIR      = BASE / "qfl_outputs"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Match to your best Regime A result ───────────────────────────────────────
+# we also need to automate the selection of our best model
 N_QUBITS  = 4
 N_LAYERS  = 2
 VQC_LR    = 0.01
@@ -772,7 +776,7 @@ def privacy_analysis_report(partitions: dict,
 
 def main():
     print("═"*70)
-    print("  WEEKS 8–9 — SIMULATED QUANTUM FEDERATED LEARNING")
+    print("  8–9 — SIMULATED QUANTUM FEDERATED LEARNING")
     print("  QML Breast Cancer Classification | Ghanaian Hospital Simulation")
     print("═"*70)
 

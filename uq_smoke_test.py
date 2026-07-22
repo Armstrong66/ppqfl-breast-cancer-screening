@@ -48,7 +48,7 @@ def auto_detect_best_vqc_config(ckpt_dir):
     return best_config, best_auc
 
 # Run the test against your actual path
-vqc_outputs_path = "/home/derrick/Projects/QFL_breast_cancer_screening/outputs/vqc_outputs/regime_A"
+vqc_outputs_path = "/home/derrick/Projects/ppqfl_breast_cancer_screening/outputs/vqc_outputs/regime_A"
 print("="*60)
 print(" RUNNING VQC CONFIG AUTO-DETECT SMOKE TEST")
 print("="*60)

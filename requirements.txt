@@ -1,23 +1,9 @@
 # =============================================================================
 # requirements.txt — QML Breast Cancer Classification Pipeline
-# =============================================================================
-# Project : Quantum-Enhanced Hybrid Architectures for Mammographic Breast
-#           Cancer Classification in African and MENA Populations
-#
-# Environment: Kaggle (Python 3.12, CUDA 12.x, Ubuntu 22.04)
-# Pinned to versions confirmed working as of April 2026.
 #
 # Installation:
 #   pip install -r requirements.txt
 #
-# Notes:
-#   - torch/torchvision must match your CUDA version if using GPU.
-#     For CPU-only: torch==2.6.0+cpu  (append +cpu to torch and torchvision)
-#   - PennyLane VQC simulation runs on CPU regardless of GPU availability.
-#   - flwr (Flower) runs in-process simulation — no network ports needed.
-#   - If migrating from Kaggle to Colab: versions below are compatible.
-#   - If migrating to a local conda env: use environment.yml instead
-#     (see bottom of this file).
 # =============================================================================
 
 # ── Core scientific stack ─────────────────────────────────────────────────────
@@ -29,7 +15,7 @@ scikit-learn==1.6.1
 # ── Deep learning ─────────────────────────────────────────────────────────────
 torch==2.10.0+cu128
 torchvision==0.25.0+cu128
-torchaudio==2.10.0+cu128                  # not directly used; paired with torch
+torchaudio==2.10.0+cu128                  
 
 # ── Quantum machine learning ──────────────────────────────────────────────────
 pennylane==0.41.1
@@ -44,7 +30,7 @@ seaborn==0.13.2
 pillow==11.3.0                     # PIL — image loading
 
 # ── Utilities ────────────────────────────────────────────────────────────────
-tqdm==4.67.3                       # progress bars
+tqdm==4.67.3
 joblib==1.5.3                      # sklearn parallel backend
 
 # ── Optional: faster PennyLane simulation ────────────────────────────────────
@@ -55,7 +41,7 @@ custatevec-cu12==1.7.0
 # =============================================================================
 # CONDA environment.yml equivalent (for local setup):
 # =============================================================================
-# name: qml_breast_cancer
+# name: qfl_breast_cancer
 # channels:
 #   - pytorch
 #   - nvidia
@@ -78,9 +64,4 @@ custatevec-cu12==1.7.0
 #     - pennylane==0.41.1
 #     - pennylane-lightning==0.41.1
 #     - flwr==1.15.2
-# =============================================================================
-#
-# To regenerate from a live Kaggle environment:
-#   !pip freeze > requirements_live.txt
-# Then cross-reference with this file and update pinned versions.
 # =============================================================================

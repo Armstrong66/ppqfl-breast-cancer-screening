@@ -16,7 +16,7 @@ Pipeline:
     → Hardware-efficient ansatz (RY + circular CNOT)
     → Expectation value ⟨Z₀⟩ → sigmoid → binary classification
 
-Outputs (/home/derrick/Projects/QFL_breast_cancer_screening/outputs/vqc_outputs/):
+Outputs (../ppqfl-breast-cancer-screening/outputs/vqc_outputs/):
   regime_A/           ← frozen classical + train VQC
   regime_B/           ← end-to-end (fine-tune CNN head + VQC jointly)
   sweep/              ← hyperparameter sweep results
@@ -24,7 +24,7 @@ Outputs (/home/derrick/Projects/QFL_breast_cancer_screening/outputs/vqc_outputs/
   ablation_table.csv  ← full comparison table for reporting
   ablation_table.png  ← visual summary
 
-Environment: Kaggle CPU (quantum simulation — no GPU needed for VQC)
+Environment: CPU (quantum simulation — no GPU needed for VQC)
              PennyLane + PyTorch — install: pip install pennylane
 =============================================================================
 """
@@ -37,7 +37,7 @@ from copy import deepcopy
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')  # non-interactive, writes files only — no display needed
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import seaborn as sns
@@ -57,21 +57,21 @@ from sklearn.metrics import (
     confusion_matrix, classification_report, roc_curve
 )
 
+from pipeline_utils import seed_everything
+
 warnings.filterwarnings("ignore")
-torch.manual_seed(42)
-np.random.seed(42)
+seed_everything(42)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 0.  CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Feature inputs (from 2b_feature_pca.py) ───────────────────────────────
-BASE      = Path("/home/derrick/Projects/QFL_breast_cancer_screening/outputs")
-FEAT_DIR  = BASE / "feature_outputs"
-OUT_DIR   = BASE / "vqc_outputs"
+# ── Feature inputs (from _2b_feature_pca.py) ───────────────────────────────
+PROJECT_ROOT  = Path(__file__).resolve().parent
+BASE          = PROJECT_ROOT / "outputs"
+FEAT_DIR      = BASE / "feature_outputs"
+OUT_DIR       = BASE / "vqc_outputs"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-# ── Classical baseline results (for ablation table) ──────────────────────────
 BASELINE_JSON = BASE / "baseline_outputs/baseline_results.json"
 
 # ── VQC hyperparameter grid (5 sweep) ───────────────────────────────────
@@ -273,6 +273,7 @@ def train_vqc(n_qubits: int, n_layers: int, lr: float,
     Returns a results dict with test metrics and parameter count.
     """
     out_subdir.mkdir(parents=True, exist_ok=True)
+    seed_everything(42)
     model     = HQCNNClassifier(n_qubits, n_layers)
     criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -499,6 +500,7 @@ def run_regime_A() -> list:
     print("═"*70)
     out = OUT_DIR / "regime_A"
     results = []
+    seed_everything(42)
 
     # Primary config: 4 qubits, 2 layers (safest starting point)
     for n_qubits, n_layers, lr in [(4, 2, 0.01), (6, 2, 0.01), (8, 2, 0.01)]:
@@ -584,6 +586,7 @@ def run_regime_B() -> list:
             def count_params(self):
                 return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+        seed_everything(42)
         model     = RegimeBModel(n_qubits, n_qubits, n_layers)
         criterion = nn.BCELoss()
         optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -747,7 +750,8 @@ def run_noise_robustness(best_regime_A_result: dict) -> list:
     print("═"*70)
     out = OUT_DIR / "noise"
     out.mkdir(parents=True, exist_ok=True)
-
+    
+    seed_everything(42)
     n_qubits = best_regime_A_result["n_qubits"]
     n_layers = best_regime_A_result["n_layers"]
     lr       = best_regime_A_result["lr"]
@@ -808,7 +812,7 @@ def run_noise_robustness(best_regime_A_result: dict) -> list:
 def main():
     print("═"*70)
     print("  3–5 — VQC TRAINING, SWEEP & ABLATION")
-    print("  QML Breast Cancer Classification | HQCNN Pipeline")
+    print("  QFL Breast Cancer Classification | HQCNN Pipeline")
     print("═"*70)
 
     from cache_check import already_done, CACHE
@@ -816,6 +820,8 @@ def main():
     # and sweep results should always be fresh. Remove this note to add caching.
 
     all_results = []
+    
+    seed_everything(42)
 
     # ── 3_: Regime A ────────────────────────────────────────────────────
     regime_A_results = run_regime_A()

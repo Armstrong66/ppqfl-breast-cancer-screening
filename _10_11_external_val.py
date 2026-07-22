@@ -1,22 +1,22 @@
 """
 =============================================================================
-WEEKS 10–11 — EXTERNAL VALIDATION + FINAL CONSOLIDATED ABLATION TABLE
+_10–11 — EXTERNAL VALIDATION + FINAL CONSOLIDATED ABLATION TABLE
 =============================================================================
 Project : Privacy-Preserving Quantum Federated Learning for Breast Cancer
           Screening in African and MENA Populations
 
 Coverage:
-  Week 10 — External validation on KAU-BCMD (Saudi Arabia / MENA)
+  10 — External validation on KAU-BCMD (Saudi Arabia / MENA)
              BI-RADS binary relabelling (1,3 → Benign; 4,5 → Malignant)
              Cross-population performance comparison (Mendeley vs KAU)
              Domain shift analysis (feature-space distance + AUC gap)
              Parameter efficiency comparison (VQC vs classical head)
 
-  Week 11 — Consolidate ALL experiment results into one master ablation table
+  11 — Consolidate ALL experiment results into one master ablation table
              Final publication-ready figures
              Cross-population generalisation report (JSON + DOCX-ready CSV)
 
-Outputs (/home/derrick/Projects/QFL_breast_cancer_screening/outputs/external_val_outputs/):
+Outputs (../ppqfl-breast-cancer-screening/outputs/external_val_outputs/):
   kau_test_results.json            ← per-model KAU performance
   cross_population_comparison.png  ← Mendeley vs KAU AUC side-by-side
   domain_shift_analysis.png        ← PCA feature distribution overlap
@@ -53,24 +53,27 @@ from sklearn.metrics import (
 )
 
 warnings.filterwarnings("ignore")
-torch.manual_seed(42)
-np.random.seed(42)
+
+from pipeline_utils import seed_everything
+seed_everything(42)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 0.  CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-FEAT_DIR        = Path("/home/derrick/Projects/QFL_breast_cancer_screening/outputs/feature_outputs")
-BASELINE_DIR    = Path("/home/derrick/Projects/QFL_breast_cancer_screening/outputs/baseline_outputs")
-VQC_DIR_A       = Path("/home/derrick/Projects/QFL_breast_cancer_screening/outputs/vqc_outputs/regime_A")
-VQC_DIR_B       = Path("/home/derrick/Projects/QFL_breast_cancer_screening/outputs/vqc_outputs/regime_B")
-NOISE_DIR       = Path("/home/derrick/Projects/QFL_breast_cancer_screening/outputs/vqc_outputs/noise")
-QFL_DIR         = Path("/home/derrick/Projects/QFL_breast_cancer_screening/outputs/qfl_outputs")
-UQ_DIR          = Path("/home/derrick/Projects/QFL_breast_cancer_screening/outputs/uq_outputs")
-OUT_DIR         = Path("/home/derrick/Projects/QFL_breast_cancer_screening/outputs/external_val_outputs")
+PROJECT_ROOT = Path(__file__).resolve().parent
+BASE         = PROJECT_ROOT / "outputs"
+FEAT_DIR     = BASE / "feature_outputs"
+BASELINE_DIR = BASE / "baseline_outputs"
+VQC_DIR_A    = BASE / "vqc_outputs/regime_A"
+VQC_DIR_B    = BASE / "vqc_outputs/regime_B"
+NOISE_DIR    = BASE / "vqc_outputs/noise"
+QFL_DIR      = BASE / "qfl_outputs"
+UQ_DIR       = BASE / "uq_outputs"
+OUT_DIR      = BASE / "external_val_outputs"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── Match to best config from Week 3–5 sweep ─────────────────────────────────
+# ── Match to best config from _3–5 sweep (this is also need to auto_detect) ─────────────────────────────────
 BACKBONE      = "mobilenetv2"
 N_QUBITS      = 4
 N_LAYERS      = 2
@@ -111,6 +114,7 @@ class VQCModel(nn.Module):
 
 
 def load_vqc(ckpt_dir, n_qubits, n_layers, lr):
+    seed_everything(42)
     model = VQCModel(n_qubits, n_layers)
     ckpt  = ckpt_dir / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt"
     if ckpt.exists():
@@ -744,11 +748,12 @@ def plot_master_ablation(df: pd.DataFrame, save_path: Path):
 
 def main():
     print("═"*70)
-    print("  WEEKS 10–11 — EXTERNAL VALIDATION + MASTER ABLATION TABLE")
+    print("  10–11 — EXTERNAL VALIDATION + MASTER ABLATION TABLE")
     print("  Cross-population: Mendeley (SA) → KAU-BCMD (MENA)")
     print("═"*70)
 
     from cache_check import already_done, CACHE
+    seed_everything(42)
 
     # ── Load KAU features ────────────────────────────────────────────────
     print("\n[1/6] Loading KAU-BCMD features...")
@@ -905,7 +910,7 @@ def main():
     CACHE.mark_done("external_validation")
 
     print("\n" + "═"*70)
-    print("  WEEKS 10–11 COMPLETE")
+    print("  10–11 COMPLETE")
     print(f"  Outputs: {OUT_DIR}")
     print("\n  Key generalisation results:")
     for name in kau_results:

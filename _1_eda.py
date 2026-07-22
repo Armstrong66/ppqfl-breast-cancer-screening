@@ -1,38 +1,12 @@
 """
 =============================================================================
-WEEK 1 — DATA AUDIT & EXPLORATORY DATA ANALYSIS
-=============================================================================
-Project : Quantum-Enhanced Hybrid Architectures for Mammographic Breast
-          Cancer Classification in African and MENA Populations
+1 — DATA AUDIT & EXPLORATORY DATA ANALYSIS
+
 Datasets: (1) Mendeley Mammogram Dataset — Polokwane, South Africa
               DOI: 10.17632/88vzgys5vg.2
           (2) KAU-BCMD — King Abdulaziz University, Saudi Arabia
               https://www.kaggle.com/asmaasaad/king-abdulaziz-university-mammogram-dataset
-Environment: Kaggle (GPU T4 x2, Python 3.10)
-Purpose : Produce a fully-documented EDA report covering class balance,
-          image quality, resolution distributions, pixel statistics, and
-          augmentation sanity checks for both datasets.
 =============================================================================
-
-KAGGLE DIRECTORY STRUCTURE ASSUMED
------------------------------------
-Adjust ROOT_MENDELEY and ROOT_KAU to match your Kaggle dataset paths.
-In Kaggle the datasets appear under /kaggle/input/<dataset-slug>/
-
-Example:
-  /kaggle/input/breast-cancer-mammography-mendeley/
-      Breast Cancer/          ← original images
-          Benign/
-          Malignant/
-      Breast Cancer Augmented/
-          Benign/
-          Malignant/
-
-  /kaggle/input/kau-bcmd/
-      KAU-BCMD/
-          Benign/
-          Malignant/
-          (or numbered subdirectory structure — adjust accordingly)
 """
 
 # ── Imports ────────────────────────────────────────────────────────────────
@@ -43,7 +17,7 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')  # non-interactive, writes files only — no display needed
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import seaborn as sns
@@ -58,11 +32,7 @@ sns.set_theme(style="whitegrid", palette="muted", font_scale=1.1)
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Mendeley (Polokwane, South Africa) ──────────────────────────────────────
-# Using Original images only (not Augmented) for EDA of ground-truth distribution
 ROOT_MENDELEY      = Path("/data/derrick/mendeley/Breast Cancer Dataset/Breast Cancer Original")
-#ROOT_MENDELEY      = Path(
-#    "/kaggle/input/datasets/armstrong67/mendeley-mammogram-image-dataset/Mammogram Image Dataset for Breast Cancer Detectio/Breast Cancer Dataset/Breast Cancer Original"
-#)
 MENDELEY_BENIGN    = ROOT_MENDELEY / "Benign"
 MENDELEY_MALIGNANT = ROOT_MENDELEY / "Malignant"
 
@@ -82,8 +52,9 @@ KAU_BIRAD_MAP = {
 KAU_BENIGN    = KAU_BIRAD_MAP[0][0]   # used only as a path-existence hint
 KAU_MALIGNANT = KAU_BIRAD_MAP[1][0]
 
-# ── Output directory (saved inside Kaggle working dir) ──────────────────────
-OUT_DIR = Path("/home/derrick/Projects/QFL_breast_cancer_screening/outputs/eda_outputs")
+PROJECT_ROOT  = Path(__file__).resolve().parent
+BASE          = PROJECT_ROOT / "outputs"
+OUT_DIR       = BASE / "eda_outputs"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SUPPORTED_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -504,8 +475,8 @@ def print_split_plan(df_m_audit: pd.DataFrame):
 
 def main():
     print("═"*70)
-    print("  WEEK 1 — DATA AUDIT & EDA")
-    print("  QML Breast Cancer Classification | African & MENA Populations")
+    print("  1 — DATA AUDIT & EDA")
+    print("  QFL Breast Cancer Classification | African & MENA Populations")
     print("═"*70)
 
     # ── Cache guard — skip if all sentinel files already exist ───────────────
