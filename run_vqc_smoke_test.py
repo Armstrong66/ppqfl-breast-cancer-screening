@@ -5,7 +5,8 @@ import numpy as np
 from pathlib import Path
 
 # Mock local dataset inputs to avoid altering production logs during testing
-BASE_DIR = Path("/home/derrick/Projects/ppqfl_breast_cancer_screening/outputs")
+# Use relative path from the script's location to outputs
+BASE_DIR = Path(__file__).resolve().parent / "outputs"
 MOCK_FEAT_DIR = BASE_DIR / "feature_outputs"
 
 print("Step 1: Synchronizing Mock Feature Data arrays for Test Coverage...")

@@ -680,9 +680,16 @@ def temperature_scale_vqc(vqc_model: HQCNNClassifier,
       Raw VQC output: p = sigmoid(logit + bias)
       Scaled output:  p_T = sigmoid((logit + bias) / T)
 
-    T > 1 softens overconfident predictions (ECE > 0.10).
-    T = 1 leaves outputs unchanged.
-    T is fitted on the validation set and applied to the test set.
+    Interpretation:
+      - T > 1  => logits are divided by T > 1, producing smaller logits and
+                softer (less confident) probabilities — useful to correct
+                overconfident models.
+      - T = 1  => no change.
+      - T < 1  => logits are amplified (division by a number < 1), producing
+                sharper (more confident) probabilities.
+
+    T is fitted on the validation set (by minimising NLL) and then applied
+    to the test set to produce calibrated probabilities.
 
     Returns:
       T_opt       : float — optimal temperature
@@ -713,7 +720,8 @@ def temperature_scale_vqc(vqc_model: HQCNNClassifier,
         return loss
 
     optimizer.step(nll_closure)
-    T_opt = T.item()
+    # Keep the final temperature within the optimisation bounds used during fitting.
+    T_opt = float(T.clamp(min=0.05).item())
 
     # Re-fit scaler on train to avoid leakage
     X_train_pca = np.load(FEAT_DIR / f"features_train_pca{VQC_N_QUBITS}.npy")
@@ -729,10 +737,11 @@ def temperature_scale_vqc(vqc_model: HQCNNClassifier,
             xi = X_test_t[i]
             z  = vqc_model.vqc(xi)
             raw_logits_test.append((z + vqc_model.bias).item())
-    logits_test  = torch.tensor(raw_logits_test)
-    probs_scaled = torch.sigmoid(logits_test / T_opt).numpy()
+    logits_test = torch.tensor(raw_logits_test)
+    logits_test_scaled = logits_test / T_opt
+    probs_scaled = torch.sigmoid(logits_test_scaled).numpy()
 
-    return T_opt, probs_scaled
+    return T_opt, probs_scaled, logits_test_scaled
 
 
 def plot_calibration_comparison(y_true, probs_before, probs_after,
@@ -877,9 +886,10 @@ def main():
     scaler_fit   = MinMaxScaler().fit(X_train_pca)
     X_val_scaled = scaler_fit.transform(X_val_pca)
 
-    T_opt, probs_scaled = temperature_scale_vqc(vqc_model, X_val_scaled, y_val)
+    T_opt, probs_scaled, logits_scaled = temperature_scale_vqc(
+        vqc_model, X_val_scaled, y_val)
     ece_after  = expected_calibration_error(y_test, probs_scaled)
-    auc_scaled = roc_auc_score(y_test, probs_scaled)
+    auc_scaled = roc_auc_score(y_test, logits_scaled)
     print(f"  Optimal T     : {T_opt:.4f}  "
           f"({'overconfident → softened' if T_opt > 1 else 'underconfident → sharpened'})")
     print(f"  ECE before    : {q_ece:.4f}")
@@ -925,7 +935,7 @@ def main():
     print("    ECE < 0.05  → well calibrated")
     print("    ECE 0.05–0.15 → moderate miscalibration (common in small datasets)")
     print("    ECE > 0.15  → overconfident — temperature scaling applied above")
-    print("\n  Next step → 8_9_qfl.py (Quantum Federated Learning)")
+    print("\n  Next step → _8_9_qfl.py (Quantum Federated Learning)")
 
 
 if __name__ == "__main__":

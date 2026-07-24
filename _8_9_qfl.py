@@ -9,12 +9,12 @@ Motivation:
   Real multi-institution federated learning requires ethical clearance and
   data sharing agreements. This script simulates QFL by partitioning the
   Mendeley dataset into 3 virtual clients representing geographically
-  plausible Ghanaian hospital tiers, with deliberately non-IID class
-  distributions to reflect real-world referral patterns:
+  plausible tiered hospital referral patterns, with deliberately non-IID
+  class distributions to reflect real-world referral patterns:
 
-    Client A — "Korle Bu Teaching Hospital, Accra"   (urban tertiary)
-    Client B — "Komfo Anokye Teaching Hospital, Kumasi" (regional urban)
-    Client C — "Tamale Teaching Hospital"             (peri-urban/rural)
+    Client A — "Tier 1 (Urban tertiary referral)"
+    Client B — "Tier 2 (Regional urban)"
+    Client C — "Tier 3 (Peri-urban/rural)"
 
   No real patient data leaves any node. Each client trains locally on its
   shard; only VQC parameters θ are aggregated (FedAvg). The backbone
@@ -48,7 +48,7 @@ Prerequisites:
 """
 
 # ── Imports ────────────────────────────────────────────────────────────────
-import json, warnings, copy
+import json, warnings, copy, re
 from pathlib import Path
 from collections import OrderedDict
 from typing import Dict, List, Tuple, Optional
@@ -97,11 +97,51 @@ VQC_CKPT_DIR = BASE / "vqc_outputs/regime_A"        # base dir — subdirs appen
 OUT_DIR      = BASE / "qfl_outputs"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def auto_detect_best_vqc_config(ckpt_dir: Path) -> Tuple[int, int, float]:
+    """Auto-detect the best VQC config from the Regime A checkpoint manifest."""
+    manifest = ckpt_dir / "best_run_manifest.json"
+    if manifest.exists():
+        with open(manifest) as f:
+            m = json.load(f)
+        n_qubits = int(m.get("n_qubits", 4))
+        n_layers = int(m.get("n_layers", 2))
+        lr = float(m.get("lr", 0.01))
+        print(f"  Auto-detect: using manifest-selected VQC config "
+              f"q={n_qubits} l={n_layers} lr={lr} "
+              "(best validation AUC from sweep)")
+        return n_qubits, n_layers, lr
+
+    best_config = None
+    best_auc = -1.0
+    for ckpt in sorted(ckpt_dir.glob("vqc_q*_l*_lr*.pt")):
+        match = re.match(r"vqc_q(\d+)_l(\d+)_lr([\d.]+)\.pt", ckpt.name)
+        if not match:
+            continue
+        nq, nl, lr = int(match.group(1)), int(match.group(2)), float(match.group(3))
+        history = ckpt_dir / f"vqc_q{nq}_l{nl}_lr{lr}_history.csv"
+        if history.exists():
+            try:
+                df = pd.read_csv(history)
+                val_auc = df["val_auc"].max()
+                if val_auc > best_auc:
+                    best_auc = val_auc
+                    best_config = (nq, nl, lr)
+            except Exception:
+                continue
+    if best_config is not None:
+        print(f"  Auto-detect: best available VQC config q={best_config[0]} "
+              f"l={best_config[1]} lr={best_config[2]} "
+              f"(val AUC={best_auc:.4f})")
+        return best_config
+
+    print("  [WARN] Could not auto-detect best VQC config from manifest or history. "
+          "Falling back to defaults.")
+    return 4, 2, 0.01
+
 # ── Match to your best Regime A result ───────────────────────────────────────
-# we also need to automate the selection of our best model
-N_QUBITS  = 4
-N_LAYERS  = 2
-VQC_LR    = 0.01
+# This should follow the best validation-AUC sweep selection.
+N_QUBITS, N_LAYERS, VQC_LR = auto_detect_best_vqc_config(VQC_CKPT_DIR)
 
 # ── FL hyperparameters ────────────────────────────────────────────────────────
 FL_CFG = {
@@ -117,19 +157,18 @@ FL_CFG = {
 # Reflects referral pattern: rural/peri-urban sees more early-stage (benign)
 # Urban tertiary sees more confirmed malignant referrals
 CLIENT_CFG = {
-    "Accra":   {"label": "Korle Bu, Accra (urban tertiary)",
-                "benign_frac": 0.50, "malignant_frac": 0.50},
-    "Kumasi":  {"label": "Komfo Anokye, Kumasi (regional)",
-                "benign_frac": 0.60, "malignant_frac": 0.40},
-    "Tamale":  {"label": "Tamale Teaching (peri-urban/rural)",
-                "benign_frac": 0.75, "malignant_frac": 0.25},
+    "Tier1": {"label": "Tier 1 (Urban tertiary referral)",
+               "benign_frac": 0.50, "malignant_frac": 0.50},
+    "Tier2": {"label": "Tier 2 (Regional urban)",
+               "benign_frac": 0.60, "malignant_frac": 0.40},
+    "Tier3": {"label": "Tier 3 (Peri-urban/rural)",
+               "benign_frac": 0.75, "malignant_frac": 0.25},
 }
 
 # ── Differential privacy simulation ─────────────────────────────────────────
 # σ_dp = 0.0 → no DP noise (baseline)
 # Run multiple σ values for privacy-utility trade-off curve
 DP_SIGMAS = [0.0, 0.01, 0.05, 0.10, 0.20]
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1.  VQC ARCHITECTURE  (identical to 3_5_vqc.py — reproduced for
@@ -181,6 +220,20 @@ class VQCModel(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
+def find_best_vqc_checkpoint(ckpt_dir: Path, n_qubits: int, n_layers: int, lr: float) -> Optional[Path]:
+    exact = ckpt_dir / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt"
+    if exact.exists():
+        return exact
+
+    candidates = sorted(ckpt_dir.glob(f"vqc_q{n_qubits}_l{n_layers}_lr*.pt"))
+    if candidates:
+        fallback = max(candidates, key=lambda p: p.stat().st_mtime)
+        print(f"  [WARN] Exact warm-start checkpoint not found: {exact.name}")
+        print(f"  [WARN] Falling back to latest matching checkpoint: {fallback.name}")
+        return fallback
+    return None
+
+
 def load_pretrained_vqc(n_qubits: int, n_layers: int, lr: float) -> VQCModel:
     """
     Warm-start the federated VQC from the best centralised Regime A checkpoint.
@@ -188,15 +241,165 @@ def load_pretrained_vqc(n_qubits: int, n_layers: int, lr: float) -> VQCModel:
     If checkpoint not found, starts from random initialisation.
     """
     model    = VQCModel(n_qubits, n_layers)
-    ckpt     = VQC_CKPT_DIR / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt"
-    if ckpt.exists():
+    ckpt     = find_best_vqc_checkpoint(VQC_CKPT_DIR, n_qubits, n_layers, lr)
+    if ckpt is not None and ckpt.exists():
         state = torch.load(ckpt, map_location="cpu")
         model.load_state_dict(state)
         print(f"  Warm-start from centralised checkpoint: {ckpt}")
     else:
-        print(f"  [INFO] No pretrained checkpoint found at {ckpt}.")
+        print(f"  [INFO] No pretrained checkpoint found for q={n_qubits} l={n_layers} lr={lr}.")
         print("  Starting FL from random VQC initialisation.")
     return model
+
+
+class MicroMLPClassifier(nn.Module):
+    """Minimal parameter-matched classical MLP used as a FedAvg baseline."""
+    def __init__(self, input_dim: int = 4):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, 2)
+        self.fc2 = nn.Linear(2, 1)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        return torch.sigmoid(self.fc2(x)).view(-1)
+
+    def get_parameters(self) -> list:
+        return [p.detach().numpy().copy() for p in self.parameters()]
+
+    def set_parameters(self, params: list):
+        with torch.no_grad():
+            for p, new_val in zip(self.parameters(), params):
+                p.copy_(torch.tensor(new_val, dtype=torch.float32))
+
+    def count_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
+class MicroMLPClient(fl.client.Client):
+    def __init__(self, cid: str, X: np.ndarray, y: np.ndarray,
+                 X_val: np.ndarray, y_val: np.ndarray,
+                 input_dim: int, dp_sigma: float = 0.0):
+        self.cid       = cid
+        self.X         = torch.tensor(X, dtype=torch.float32)
+        self.y         = torch.tensor(y, dtype=torch.long)
+        self.X_val     = torch.tensor(X_val, dtype=torch.float32)
+        self.y_val     = torch.tensor(y_val, dtype=torch.long)
+        self.input_dim = input_dim
+        self.dp_sigma  = dp_sigma
+        self.model     = MicroMLPClassifier(input_dim)
+        # Store local validation metrics for per-client tracking
+        self.local_val_auc = None
+
+    def get_parameters(self, ins: GetParametersIns) -> GetParametersRes:
+        params = ndarrays_to_parameters(self.model.get_parameters())
+        return GetParametersRes(
+            status=Status(code=Code.OK, message="OK"),
+            parameters=params,
+        )
+
+    def fit(self, ins: FitIns) -> FitRes:
+        global_params = parameters_to_ndarrays(ins.parameters)
+        self.model.set_parameters(global_params)
+
+        dataset   = TensorDataset(self.X, self.y.float())
+        loader    = DataLoader(dataset, batch_size=FL_CFG["batch_size"], shuffle=True)
+        criterion = nn.BCELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=FL_CFG["local_lr"])
+
+        self.model.train()
+        for _ in range(FL_CFG["local_epochs"]):
+            for X_b, y_b in loader:
+                optimizer.zero_grad()
+                loss = criterion(self.model(X_b), y_b)
+                loss.backward()
+                if self.dp_sigma > 0:
+                    for param in self.model.parameters():
+                        if param.grad is not None:
+                            param.grad += torch.randn_like(param.grad) * self.dp_sigma
+                optimizer.step()
+
+        updated_params = self.model.get_parameters()
+        return FitRes(
+            status=Status(code=Code.OK, message="OK"),
+            parameters=ndarrays_to_parameters(updated_params),
+            num_examples=len(self.X),
+            metrics={},
+        )
+
+    def evaluate(self, ins: EvaluateIns) -> EvaluateRes:
+        """Evaluate on client's local data (not global validation set).
+
+        Returns per-client AUC for monitoring heterogeneity across clients.
+        """
+        self.model.set_parameters(parameters_to_ndarrays(ins.parameters))
+        self.model.eval()
+        # Use local training data for per-client evaluation
+        with torch.no_grad():
+            probs = self.model(self.X).numpy()
+        y_true = self.y.numpy()
+        auc    = roc_auc_score(y_true, probs) if len(set(y_true)) > 1 else 0.0
+        preds  = (probs > 0.5).astype(int)
+        acc    = accuracy_score(y_true, preds)
+        loss   = float(nn.BCELoss()(torch.tensor(probs), torch.tensor(y_true, dtype=torch.float32)).item())
+        return EvaluateRes(
+            status=Status(code=Code.OK, message="OK"),
+            loss=loss,
+            num_examples=len(self.X),
+            metrics={"auc": auc, "accuracy": acc},
+        )
+
+
+def run_classical_fedavg_baseline(partitions: dict,
+                                  X_val: np.ndarray, y_val: np.ndarray,
+                                  X_test: np.ndarray, y_test: np.ndarray,
+                                  input_dim: int,
+                                  n_rounds: int,
+                                  dp_sigma: float = 0.0) -> dict:
+    """Simulate classical FedAvg using a micro-MLP baseline."""
+    global_model = MicroMLPClassifier(input_dim)
+    global_params = global_model.get_parameters()
+
+    clients = {
+        name: MicroMLPClient(
+            cid=name,
+            X=partitions[name]["X"],
+            y=partitions[name]["y"],
+            X_val=X_val,
+            y_val=y_val,
+            input_dim=input_dim,
+            dp_sigma=dp_sigma,
+        )
+        for name in partitions
+    }
+
+    for round_num in range(1, n_rounds + 1):
+        client_updates = []
+        for client in clients.values():
+            fit_ins = FitIns(parameters=ndarrays_to_parameters(global_params), config={})
+            fit_res = client.fit(fit_ins)
+            client_updates.append((parameters_to_ndarrays(fit_res.parameters), fit_res.num_examples))
+
+        total_samples = sum(n for _, n in client_updates)
+        aggregated = [
+            sum(params[i] * (n / total_samples) for params, n in client_updates)
+            for i in range(len(global_params))
+        ]
+        global_params = aggregated
+        global_model.set_parameters(global_params)
+
+    global_model.eval()
+    with torch.no_grad():
+        val_p  = global_model(torch.tensor(X_val,  dtype=torch.float32)).numpy()
+        test_p = global_model(torch.tensor(X_test, dtype=torch.float32)).numpy()
+
+    return {
+        "val_auc": round(roc_auc_score(y_val,  val_p), 4),
+        "test_auc": round(roc_auc_score(y_test, test_p), 4),
+        "test_f1": round(f1_score(y_test, (test_p > 0.5).astype(int), zero_division=0), 4),
+        "test_accuracy": round(accuracy_score(y_test, (test_p > 0.5).astype(int)), 4),
+        "params": global_model.count_params(),
+        "n_rounds": n_rounds,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -288,7 +491,7 @@ def plot_partition_summary(partitions: dict, save_path: Path):
 
     fig, axes = plt.subplots(1, n_clients + 1, figsize=(5 * (n_clients + 1), 5))
     fig.suptitle("Non-IID Data Partition Across Virtual Clients\n"
-                 "Simulating Ghanaian Hospital Referral Patterns",
+                 "Simulating Tiered Healthcare Referral Patterns",
                  fontweight="bold", fontsize=12)
 
     all_b, all_m = [], []
@@ -399,11 +602,16 @@ class QFLClient(fl.client.Client):
         )
 
     def evaluate(self, ins: EvaluateIns) -> EvaluateRes:
+        """Evaluate on client's local data (not global validation set).
+
+        Returns per-client AUC for monitoring heterogeneity across clients.
+        """
         self.model.set_parameters(parameters_to_ndarrays(ins.parameters))
         self.model.eval()
+        # Use local training data for per-client evaluation
         with torch.no_grad():
-            probs = self.model(self.X_val).numpy()
-        y_true = self.y_val.numpy()
+            probs = self.model(self.X).numpy()
+        y_true = self.y.numpy()
         auc    = roc_auc_score(y_true, probs) if len(set(y_true)) > 1 else 0.0
         preds  = (probs > 0.5).astype(int)
         acc    = accuracy_score(y_true, preds)
@@ -413,7 +621,7 @@ class QFLClient(fl.client.Client):
         return EvaluateRes(
             status=Status(code=Code.OK, message="OK"),
             loss=loss,
-            num_examples=len(self.X_val),
+            num_examples=len(self.X),
             metrics={"auc": auc, "accuracy": acc},
         )
 
@@ -468,16 +676,20 @@ def run_federated_simulation(partitions: dict,
     for round_num in range(1, n_rounds + 1):
         # ── Local training on each client ─────────────────────────────────
         client_updates = []
+        client_local_params = {}
         for name, client in clients.items():
             fit_ins = FitIns(
                 parameters=ndarrays_to_parameters(global_params),
                 config={}
             )
             fit_res = client.fit(fit_ins)
+            params = parameters_to_ndarrays(fit_res.parameters)
             client_updates.append((
-                parameters_to_ndarrays(fit_res.parameters),
+                params,
                 fit_res.num_examples,
             ))
+            # Store the client's local parameters so we can evaluate the true local model
+            client_local_params[name] = params
 
         # ── FedAvg aggregation ────────────────────────────────────────────
         total_samples = sum(n for _, n in client_updates)
@@ -513,8 +725,10 @@ def run_federated_simulation(partitions: dict,
 
         # Per-client local AUC (client drift monitoring)
         for name, client in clients.items():
+            # Evaluate the client's own locally-trained parameters (not the global broadcast)
+            local_params = client_local_params.get(name, global_params)
             eval_ins = EvaluateIns(
-                parameters=ndarrays_to_parameters(global_params), config={}
+                parameters=ndarrays_to_parameters(local_params), config={}
             )
             eval_res = client.evaluate(eval_ins)
             row[f"client_{name}_auc"] = round(eval_res.metrics["auc"], 4)
@@ -596,7 +810,7 @@ def plot_federated_vs_centralised(fed_history: pd.DataFrame,
                                    save_path: Path):
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     fig.suptitle("Federated (QFL) vs Centralised Training\n"
-                 "VQC on Mendeley Dataset — Simulated Ghanaian Hospital Clients",
+                 "VQC on Mendeley Dataset — Simulated Tiered Hospital Clients",
                  fontweight="bold")
 
     ax = axes[0]
@@ -701,7 +915,8 @@ def plot_privacy_utility_tradeoff(dp_results: list, save_path: Path):
 def privacy_analysis_report(partitions: dict,
                               fed_result: dict,
                               centralised_result: dict,
-                              dp_results: list) -> dict:
+                              dp_results: list,
+                              classical_baseline_result: Optional[dict] = None) -> dict:
     """
     Generate a structured privacy analysis summary for reporting.
     Covers:
@@ -736,6 +951,14 @@ def privacy_analysis_report(partitions: dict,
             "centralised_test_f1":   centralised_result["test_f1"],
             "federated_test_f1":     fed_result["final_test_f1"],
             "f1_utility_gap":        round(f1_gap, 4),
+            "classical_fedavg_test_auc": (
+                classical_baseline_result["test_auc"]
+                if classical_baseline_result is not None else None
+            ),
+            "classical_fedavg_test_f1": (
+                classical_baseline_result["test_f1"]
+                if classical_baseline_result is not None else None
+            ),
             "interpretation":        (
                 f"Federated training achieves {fed_result['final_test_auc']:.4f} AUC "
                 f"vs {centralised_result['test_auc']:.4f} centralised "
@@ -777,19 +1000,27 @@ def privacy_analysis_report(partitions: dict,
 def main():
     print("═"*70)
     print("  8–9 — SIMULATED QUANTUM FEDERATED LEARNING")
-    print("  QML Breast Cancer Classification | Ghanaian Hospital Simulation")
+    print("  QFL Breast Cancer Classification | Tiered Virtual Client Simulation")
     print("═"*70)
 
     from cache_check import already_done, CACHE
+    if already_done("qfl"):
+        print("  [SKIP] QFL pipeline already completed (cache hit: qfl)")
+        return
+
+    print(f"  VQC config for federated experiments: q={N_QUBITS}, l={N_LAYERS}, lr={VQC_LR}")
+    print(f"  The VQC configuration used in the federated experiments "
+          f"(q={N_QUBITS}, l={N_LAYERS}) was selected by hyperparameter sweep "
+          "on the validation split of the primary cohort prior to any federated training.")
 
     # ── Load and scale features ───────────────────────────────────────────
-    print("\n[1/7] Loading features...")
+    print("\n[1/8] Loading features...")
     X_train, y_train, X_val, y_val, X_test, y_test = \
         load_and_scale_features(N_QUBITS)
     print(f"  Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
 
     # ── Non-IID partition ─────────────────────────────────────────────────
-    print("\n[2/7] Creating non-IID partitions...")
+    print("\n[2/8] Creating non-IID partitions...")
     partitions = partition_non_iid(X_train, y_train, CLIENT_CFG,
                                     FL_CFG["random_state"])
     for name, data in partitions.items():
@@ -800,12 +1031,12 @@ def main():
     plot_partition_summary(partitions, OUT_DIR / "partition_summary.png")
 
     # ── Warm-start parameters from centralised Regime A ───────────────────
-    print("\n[3/7] Loading warm-start checkpoint...")
+    print("\n[3/8] Loading warm-start checkpoint...")
     pretrained = load_pretrained_vqc(N_QUBITS, N_LAYERS, VQC_LR)
     warm_params = pretrained.get_parameters()
 
     # ── Centralised baseline ──────────────────────────────────────────────
-    print("\n[4/7] Running centralised baseline...")
+    print("\n[4/8] Running centralised baseline...")
     centralised_result = run_centralised_baseline(
         X_train, y_train, X_val, y_val, X_test, y_test,
         N_QUBITS, N_LAYERS, warm_start_params=warm_params
@@ -813,8 +1044,20 @@ def main():
     print(f"  Centralised — Test AUC={centralised_result['test_auc']:.4f} "
           f"F1={centralised_result['test_f1']:.4f}")
 
+    # ── Classical FedAvg micro-MLP baseline ───────────────────────────────
+    print("\n[5/8] Running classical FedAvg micro-MLP baseline...")
+    classical_fedavg_result = run_classical_fedavg_baseline(
+        partitions, X_val, y_val, X_test, y_test,
+        input_dim=N_QUBITS,
+        n_rounds=FL_CFG["n_rounds"],
+        dp_sigma=0.0,
+    )
+    print(f"  Classical FedAvg micro-MLP — Test AUC={classical_fedavg_result['test_auc']:.4f} "
+          f"F1={classical_fedavg_result['test_f1']:.4f} "
+          f"Params={classical_fedavg_result['params']}")
+
     # ── Main QFL simulation (no DP) ───────────────────────────────────────
-    print("\n[5/7] Running QFL simulation (σ_dp=0.0)...")
+    print("\n[6/8] Running QFL simulation (σ_dp=0.0)...")
     fed_history, global_model, fed_result = run_federated_simulation(
         partitions, X_val, y_val, X_test, y_test,
         N_QUBITS, N_LAYERS, FL_CFG["n_rounds"],
@@ -837,7 +1080,7 @@ def main():
     )
 
     # ── Privacy-utility trade-off sweep ──────────────────────────────────
-    print("\n[6/7] Privacy-utility trade-off (DP noise sweep)...")
+    print("\n[7/8] Privacy-utility trade-off (DP noise sweep)...")
     dp_results = []
     for sigma in DP_SIGMAS:
         print(f"\n  σ_dp = {sigma}")
@@ -853,9 +1096,10 @@ def main():
                                    OUT_DIR / "privacy_utility_tradeoff.png")
 
     # ── Privacy analysis report ────────────────────────────────────────────
-    print("\n[7/7] Generating privacy analysis report...")
+    print("\n[8/8] Generating privacy analysis report...")
     report = privacy_analysis_report(
-        partitions, fed_result, centralised_result, dp_results
+        partitions, fed_result, centralised_result, dp_results,
+        classical_baseline_result=classical_fedavg_result,
     )
     with open(OUT_DIR / "qfl_summary.json", "w") as f:
         json.dump(report, f, indent=2)
@@ -868,6 +1112,8 @@ def main():
     print(f"  QFL test AUC         : {fed_result['final_test_auc']:.4f}  "
           f"(gap: {centralised_result['test_auc']-fed_result['final_test_auc']:.4f})")
     print(f"  QFL test F1          : {fed_result['final_test_f1']:.4f}")
+    print(f"  Micro-MLP FedAvg test AUC : {classical_fedavg_result['test_auc']:.4f} "
+          f"F1={classical_fedavg_result['test_f1']:.4f} Params={classical_fedavg_result['params']}")
     print(f"  VQC params federated : {fed_result['vqc_params']}")
     print(f"\n  Privacy: raw data NEVER transmitted.")
     print(f"  Only {fed_result['vqc_params']} VQC parameters shared per round.")

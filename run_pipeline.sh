@@ -9,8 +9,8 @@
 #   chmod +x run_pipeline.sh
 #   mkdir -p pipeline_logs && nohup bash run_pipeline.sh > pipeline_logs/nohup_full.log 2>&1 & echo "PID: $!"
 #
-#   ./run_pipeline.sh --from 3_5_vqc   # resume from stage
-#   ./run_pipeline.sh --only 8_9_qfl   # run one stage only
+#   ./run_pipeline.sh --from _3_5_vqc   # resume from stage
+#   ./run_pipeline.sh --only _8_9_qfl   # run one stage only
 #   ./run_pipeline.sh --skip-slow      # minimal VQC sweep (full by default)
 #
 # Stage names (use exactly these strings with --from / --only):
@@ -277,7 +277,7 @@ main() {
             else
                 failed_stages+=("$stage")
                 log_err "Pipeline halted at stage: $stage"
-                log_info "Resume: mkdir -p pipeline_logs && nohup bash run_pipeline.sh --from $stage > pipeline_logs/nohup_resume.log 2>&1 & echo "PID: $!""
+                log_info "Resume: mkdir -p pipeline_logs && nohup bash run_pipeline.sh --from $stage > pipeline_logs/nohup_resume.log 2>&1 & echo \"PID: \$!\""
                 break
             fi
         else

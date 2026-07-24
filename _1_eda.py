@@ -12,7 +12,7 @@ Datasets: (1) Mendeley Mammogram Dataset — Polokwane, South Africa
 # ── Imports ────────────────────────────────────────────────────────────────
 import os, warnings, json
 from pathlib import Path
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import numpy as np
 import pandas as pd
@@ -28,11 +28,56 @@ warnings.filterwarnings("ignore")
 sns.set_theme(style="whitegrid", palette="muted", font_scale=1.1)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 0.  CONFIGURATION  —  Edit these paths to match your Kaggle input structure
-# ══════════════════════════════════════════════════════════════════════════════
+# 0.  CONFIGURATION  —  Auto-detect paths to dataset directories
+# ═════════════════════════════════════════════════════════════════════════════
+
+def find_mendeley_root() -> Path:
+    """Auto-detect the Mendeley dataset root directory.
+
+    Searches relative to this script's location for the dataset.
+    The dataset should be located at:
+      - scripts/Breast Cancer Dataset/Breast Cancer Original (relative to script)
+      - parent of scripts/Breast Cancer Dataset/Breast Cancer Original
+    """
+    script_dir = Path(__file__).resolve().parent
+    relative_paths = [
+        script_dir / "Breast Cancer Dataset/Breast Cancer Original",
+        script_dir.parent / "Breast Cancer Dataset/Breast Cancer Original",
+        Path("./Breast Cancer Dataset/Breast Cancer Original"),
+        Path("../Breast Cancer Dataset/Breast Cancer Original"),
+    ]
+    for p in relative_paths:
+        if p.exists() and (p / "Benign").exists() and (p / "Malignant").exists():
+            return p.resolve()
+    raise FileNotFoundError(
+        f"Mendeley dataset not found. Searched relative paths:\n"
+        f"  " + "\n  ".join(str(p) for p in relative_paths) + "\n"
+        f"Ensure the dataset is located at one of these paths with Benign/ and Malignant/ subfolders."
+    )
+
+def find_kau_root() -> Path:
+    """Auto-detect the KAU-BCMD dataset root directory.
+
+    Searches relative to this script's location for the dataset.
+    """
+    script_dir = Path(__file__).resolve().parent
+    relative_paths = [
+        script_dir / "kau",
+        script_dir.parent / "kau",
+        Path("./kau"),
+        Path("../kau"),
+    ]
+    for p in relative_paths:
+        if p.exists() and (p / "BIRAD1").exists():
+            return p.resolve()
+    raise FileNotFoundError(
+        f"KAU-BCMD dataset not found. Searched relative paths:\n"
+        f"  " + "\n  ".join(str(p) for p in relative_paths) + "\n"
+        f"Ensure the dataset is located at one of these paths with BIRAD1/ subfolder."
+    )
 
 # ── Mendeley (Polokwane, South Africa) ──────────────────────────────────────
-ROOT_MENDELEY      = Path("/data/derrick/mendeley/Breast Cancer Dataset/Breast Cancer Original")
+ROOT_MENDELEY = find_mendeley_root()
 MENDELEY_BENIGN    = ROOT_MENDELEY / "Benign"
 MENDELEY_MALIGNANT = ROOT_MENDELEY / "Malignant"
 
@@ -41,7 +86,7 @@ MENDELEY_MALIGNANT = ROOT_MENDELEY / "Malignant"
 # Binarisation follows clinical convention:
 #   BI-RADS 1, 3  → Benign   (label 0)
 #   BI-RADS 4, 5  → Malignant (label 1)
-ROOT_KAU = Path("/data/derrick/kau")
+ROOT_KAU = find_kau_root()
 KAU_BIRAD_MAP = {
     0: [ROOT_KAU / "BIRAD1" / "b1",
         ROOT_KAU / "Birad3" / "b3"],        # Benign
@@ -64,14 +109,40 @@ SUPPORTED_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 # 1.  UTILITY FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
+MASK_FOLDER_HINTS = {
+    "mask", "masks", "segmentation", "segmentations",
+    "ground_truth", "groundtruth", "gt",
+}
+MASK_FILENAME_HINTS = {
+    "mask", "segmentation", "segmentations",
+    "ground_truth", "groundtruth", "gt",
+}
+
+
+def is_mask_path(path: Path) -> bool:
+    """Detect mask/segmentation derivative files by folder structure or filename hints."""
+    parts = [part.lower() for part in path.parts[:-1]]
+    if any(any(hint in part for hint in MASK_FOLDER_HINTS) for part in parts):
+        return True
+    stem = path.stem.lower()
+    return any(hint in stem for hint in MASK_FILENAME_HINTS)
+
+
 def collect_image_paths(benign_dir: Path, malignant_dir: Path,
                         dataset_name: str) -> pd.DataFrame:
     """
     Walk the benign and malignant directories and collect image metadata.
+    Exclude binary mask/derivative images from Mendeley at collection time.
+
     Returns a DataFrame with columns:
         path, label, label_int, filename, ext, dataset
     """
     records = []
+    skipped_mask_folder = 0
+    skipped_binary_mode = 0
+    skipped_mask_paths = []
+    skipped_mode_paths = []
+    skipped_mode_dims = []
     for label, label_int, directory in [
         ("Benign",    0, benign_dir),
         ("Malignant", 1, malignant_dir),
@@ -82,6 +153,21 @@ def collect_image_paths(benign_dir: Path, malignant_dir: Path,
             continue
         files = [f for f in directory.rglob("*") if f.suffix.lower() in SUPPORTED_EXT]
         for f in files:
+            if is_mask_path(f):
+                skipped_mask_folder += 1
+                skipped_mask_paths.append(f)
+                continue
+            try:
+                with Image.open(f) as img:
+                    if img.mode == "1":
+                        skipped_binary_mode += 1
+                        skipped_mode_paths.append(f)
+                        skipped_mode_dims.append((img.width, img.height))
+                        continue
+            except Exception:
+                # Keep corrupt/unreadable files for audit reporting later.
+                pass
+
             records.append({
                 "path":      str(f),
                 "label":     label,
@@ -90,6 +176,23 @@ def collect_image_paths(benign_dir: Path, malignant_dir: Path,
                 "ext":       f.suffix.lower(),
                 "dataset":   dataset_name,
             })
+    if skipped_mask_folder > 0:
+        folders = sorted({p.parent.name for p in skipped_mask_paths})
+        folder_counts = Counter(p.parent.name for p in skipped_mask_paths)
+        print(f"  Skipped {skipped_mask_folder} files from mask/segmentation folders: {folders}")
+        print(f"    Folder counts: {dict(folder_counts)}")
+    if skipped_binary_mode > 0:
+        folders = sorted({p.parent.name for p in skipped_mode_paths})
+        dims = np.array(skipped_mode_dims, dtype=int)
+        dim_desc = {
+            "min_width": int(dims[:, 0].min()),
+            "max_width": int(dims[:, 0].max()),
+            "min_height": int(dims[:, 1].min()),
+            "max_height": int(dims[:, 1].max()),
+            "most_common": Counter(map(tuple, dims)).most_common(3),
+        }
+        print(f"  Skipped {skipped_binary_mode} binary mask files by image mode: {folders}")
+        print(f"    Mode='1' dimensions summary: {dim_desc}")
     df = pd.DataFrame(records)
     if df.empty:
         raise FileNotFoundError(
@@ -109,6 +212,10 @@ def collect_kau_paths(birad_map: dict, dataset_name: str = "KAU-BCMD") -> pd.Dat
     """
     label_names = {0: "Benign", 1: "Malignant"}
     records = []
+    skipped_mask_folder = 0
+    skipped_binary_mode = 0
+    skipped_mask_paths = []
+    skipped_mode_paths = []
     for label_int, dirs in birad_map.items():
         for directory in dirs:
             if not directory.exists():
@@ -116,6 +223,18 @@ def collect_kau_paths(birad_map: dict, dataset_name: str = "KAU-BCMD") -> pd.Dat
                 continue
             files = [f for f in directory.rglob("*") if f.suffix.lower() in SUPPORTED_EXT]
             for f in files:
+                if is_mask_path(f):
+                    skipped_mask_folder += 1
+                    skipped_mask_paths.append(f)
+                    continue
+                try:
+                    with Image.open(f) as img:
+                        if img.mode == "1":
+                            skipped_binary_mode += 1
+                            skipped_mode_paths.append(f)
+                            continue
+                except Exception:
+                    pass
                 records.append({
                     "path":      str(f),
                     "label":     label_names[label_int],
@@ -125,6 +244,12 @@ def collect_kau_paths(birad_map: dict, dataset_name: str = "KAU-BCMD") -> pd.Dat
                     "dataset":   dataset_name,
                     "birad_dir": directory.name,
                 })
+    if skipped_mask_folder > 0:
+        folders = sorted({p.parent.name for p in skipped_mask_paths})
+        print(f"  Skipped {skipped_mask_folder} KAU files from mask/segmentation folders: {folders}")
+    if skipped_binary_mode > 0:
+        folders = sorted({p.parent.name for p in skipped_mode_paths})
+        print(f"  Skipped {skipped_binary_mode} KAU binary mask files by image mode: {folders}")
     df = pd.DataFrame(records)
     if df.empty:
         raise FileNotFoundError(

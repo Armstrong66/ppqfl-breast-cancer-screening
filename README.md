@@ -31,13 +31,13 @@ aggregated — raw patient data never leaves any node.
 ```
 ppqfl-breast-cancer-screening/
 │
-├── 1_eda.py                    # Phase 1: Data audit & EDA (Mendeley + KAU-BCMD)
-├── 2a_baseline.py              # Phase 2a: MobileNetV2 classical baseline
-├── 2b_feature_pca.py           # Phase 2b: Feature extraction + PCA → quantum bridge
-├── 3_5_vqc.py                  # Phases 3–5: VQC design, Regime A/B, sweep, noise
-├── 6_7_uq.py                   # Phases 6–7: Uncertainty quantification + temperature scaling
-├── 8_9_qfl.py                  # Phases 8–9: Simulated QFL + differential privacy
-├── 10_11_external_val.py       # Phases 10–11: KAU external validation + ablation table
+├── _1_eda.py                   # Phase 1: Data audit & EDA (Mendeley + KAU-BCMD)
+├── _2a_baseline.py             # Phase 2a: MobileNetV2 classical baseline
+├── _2b_feature_pca.py          # Phase 2b: Feature extraction + PCA → quantum bridge
+├── _3_5_vqc.py                 # Phases 3–5: VQC design, Regime A/B, sweep, noise
+├── _6_7_uq.py                  # Phases 6–7: Uncertainty quantification + temperature scaling
+├── _8_9_qfl.py                 # Phases 8–9: Simulated QFL + differential privacy
+├── _10_11_external_val.py      # Phases 10–11: KAU external validation + ablation table
 │
 ├── cache_check.py              # Pipeline cache guard (skip completed stages)
 ├── run_pipeline.sh             # Full pipeline orchestrator (nohup / screen ready)
@@ -104,7 +104,7 @@ tail -f pipeline_logs/nohup_full.log
 bash run_pipeline.sh --from 6_7_uq
 
 # Run one stage only
-bash run_pipeline.sh --only 8_9_qfl
+bash run_pipeline.sh --only _8_9_qfl
 ```
 
 ### 4. Reset cache (force rerun of a stage)
@@ -121,13 +121,13 @@ CACHE.reset()        # reset all
 
 | Phase | Script | Key output |
 |-------|--------|------------|
-| 1 | `1_eda.py` | EDA report, stratified split indices |
-| 2a | `2a_baseline.py` | MobileNetV2 checkpoint, classical AUC |
-| 2b | `2b_feature_pca.py` | PCA-compressed `.npy` feature arrays |
-| 3–5 | `3_5_vqc.py` | HQCNN Regime A/B results, ablation table |
-| 6–7 | `6_7_uq.py` | MC-Dropout + quantum shot variance, ECE, temperature scaling |
-| 8–9 | `8_9_qfl.py` | QFL simulation, privacy-utility trade-off curve |
-| 10–11 | `10_11_external_val.py` | KAU cross-population results, master ablation table |
+| 1 | `_1_eda.py` | EDA report, stratified split indices |
+| 2a | `_2a_baseline.py` | MobileNetV2 checkpoint, classical AUC |
+| 2b | `_2b_feature_pca.py` | PCA-compressed `.npy` feature arrays |
+| 3–5 | `_3_5_vqc.py` | HQCNN Regime A/B results, ablation table |
+| 6–7 | `_6_7_uq.py` | MC-Dropout + quantum shot variance, ECE, temperature scaling |
+| 8–9 | `_8_9_qfl.py` | QFL simulation, privacy-utility trade-off curve |
+| 10–11 | `_10_11_external_val.py` | KAU cross-population results, master ablation table |
 
 ---
 

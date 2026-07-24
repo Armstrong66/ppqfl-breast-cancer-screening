@@ -73,11 +73,54 @@ seed_everything(42)
 # 0.  CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-ROOT_MENDELEY      = Path("/data/derrick/mendeley/Breast Cancer Dataset/Breast Cancer Original")
+# ── Dataset paths (auto-detect) ──────────────────────────────────────
+def find_mendeley_root() -> Path:
+    """Auto-detect the Mendeley dataset root directory.
+
+    Searches relative to this script's location for the dataset.
+    """
+    script_dir = Path(__file__).resolve().parent
+    relative_paths = [
+        script_dir / "Breast Cancer Dataset/Breast Cancer Original",
+        script_dir.parent / "Breast Cancer Dataset/Breast Cancer Original",
+        Path("./Breast Cancer Dataset/Breast Cancer Original"),
+        Path("../Breast Cancer Dataset/Breast Cancer Original"),
+    ]
+    for p in relative_paths:
+        if p.exists() and (p / "Benign").exists() and (p / "Malignant").exists():
+            return p.resolve()
+    raise FileNotFoundError(
+        f"Mendeley dataset not found. Searched relative paths:\n"
+        f"  " + "\n  ".join(str(p) for p in relative_paths) + "\n"
+        f"Ensure the dataset is located at one of these paths with Benign/ and Malignant/ subfolders."
+    )
+
+def find_kau_root() -> Path:
+    """Auto-detect the KAU-BCMD dataset root directory.
+
+    Searches relative to this script's location for the dataset.
+    """
+    script_dir = Path(__file__).resolve().parent
+    relative_paths = [
+        script_dir / "kau",
+        script_dir.parent / "kau",
+        Path("./kau"),
+        Path("../kau"),
+    ]
+    for p in relative_paths:
+        if p.exists() and (p / "BIRAD1").exists():
+            return p.resolve()
+    raise FileNotFoundError(
+        f"KAU-BCMD dataset not found. Searched relative paths:\n"
+        f"  " + "\n  ".join(str(p) for p in relative_paths) + "\n"
+        f"Ensure the dataset is located at one of these paths with BIRAD1/ subfolder."
+    )
+
+ROOT_MENDELEY = find_mendeley_root()
 MENDELEY_BENIGN    = ROOT_MENDELEY / "Benign"
 MENDELEY_MALIGNANT = ROOT_MENDELEY / "Malignant"
 
-ROOT_KAU = Path("/data/derrick/kau")
+ROOT_KAU = find_kau_root()
 KAU_BIRAD_MAP = {
     0: [ROOT_KAU / "BIRAD1" / "b1",
         ROOT_KAU / "Birad3" / "b3"],
@@ -114,22 +157,50 @@ SUPPORTED_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 print(f"Device: {DEVICE}")
 
 
+# ── Mask detection hints (same as _1_eda.py) ─────────────────────────────────
+MASK_FOLDER_HINTS = {
+    "mask", "masks", "segmentation", "segmentations",
+    "ground_truth", "groundtruth", "gt",
+}
+MASK_FILENAME_HINTS = {
+    "mask", "segmentation", "segmentations",
+    "ground_truth", "groundtruth", "gt",
+}
+
+
+def is_mask_path(path: Path) -> bool:
+    """Detect mask/segmentation derivative files by folder structure or filename hints."""
+    parts = [part.lower() for part in path.parts[:-1]]
+    if any(any(hint in part for hint in MASK_FOLDER_HINTS) for part in parts):
+        return True
+    stem = path.stem.lower()
+    return any(hint in stem for hint in MASK_FILENAME_HINTS)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 1.  DATASET UTILITIES
 # ══════════════════════════════════════════════════════════════════════════════
 
 def collect_paths(benign_dir: Path, malignant_dir: Path) -> pd.DataFrame:
+    """Collect image paths excluding mask/segmentation files."""
     records = []
+    skipped_mask_folder = 0
     for label_int, directory in [(0, benign_dir), (1, malignant_dir)]:
         for f in directory.rglob("*"):
             if f.suffix.lower() in SUPPORTED_EXT:
+                if is_mask_path(f):
+                    skipped_mask_folder += 1
+                    continue
                 records.append({"path": str(f), "label": label_int})
+    if skipped_mask_folder > 0:
+        print(f"  Skipped {skipped_mask_folder} mask/segmentation files")
     return pd.DataFrame(records)
 
 
 def collect_kau_paths(birad_map: dict) -> pd.DataFrame:
     """Collect KAU-BCMD images from BI-RADS graded subdirectories."""
     records = []
+    skipped_mask_folder = 0
     for label_int, dirs in birad_map.items():
         for directory in dirs:
             if not directory.exists():
@@ -137,7 +208,12 @@ def collect_kau_paths(birad_map: dict) -> pd.DataFrame:
                 continue
             for f in directory.rglob("*"):
                 if f.suffix.lower() in SUPPORTED_EXT:
+                    if is_mask_path(f):
+                        skipped_mask_folder += 1
+                        continue
                     records.append({"path": str(f), "label": label_int})
+    if skipped_mask_folder > 0:
+        print(f"  Skipped {skipped_mask_folder} KAU mask/segmentation files")
     return pd.DataFrame(records)
 
 

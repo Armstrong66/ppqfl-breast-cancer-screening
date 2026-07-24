@@ -58,10 +58,31 @@ seed_everything(42)
 # 0.  CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Dataset paths (same as 1_eda.py — adjust if needed) ─────────────────
-ROOT_MENDELEY      = Path("/data/derrick/mendeley/Breast Cancer Dataset/Breast Cancer Original")
+# ── Dataset paths (auto-detect) ──────────────────────────────────────
+def find_mendeley_root() -> Path:
+    """Auto-detect the Mendeley dataset root directory.
+
+    Searches relative to this script's location for the dataset.
+    """
+    script_dir = Path(__file__).resolve().parent
+    relative_paths = [
+        script_dir / "Breast Cancer Dataset/Breast Cancer Original",
+        script_dir.parent / "Breast Cancer Dataset/Breast Cancer Original",
+        Path("./Breast Cancer Dataset/Breast Cancer Original"),
+        Path("../Breast Cancer Dataset/Breast Cancer Original"),
+    ]
+    for p in relative_paths:
+        if p.exists() and (p / "Benign").exists() and (p / "Malignant").exists():
+            return p.resolve()
+    raise FileNotFoundError(
+        f"Mendeley dataset not found. Searched relative paths:\n"
+        f"  " + "\n  ".join(str(p) for p in relative_paths) + "\n"
+        f"Ensure the dataset is located at one of these paths with Benign/ and Malignant/ subfolders."
+    )
+
+ROOT_MENDELEY = find_mendeley_root()
 MENDELEY_BENIGN    = ROOT_MENDELEY / "Benign"
-MENDELEY_MALIGNANT = ROOT_MENDELEYf / "Malignant"
+MENDELEY_MALIGNANT = ROOT_MENDELEY / "Malignant"
 
 # ── Load split indices saved by _1_eda.py (for reproducibility) ──────────
 PROJECT_ROOT     = Path(__file__).resolve().parent
@@ -274,7 +295,15 @@ def evaluate(model, loader, criterion, device):
     avg_loss = total_loss / len(loader.dataset)
     acc      = accuracy_score(all_labels, all_preds)
     f1       = f1_score(all_labels, all_preds, zero_division=0)
-    auc      = roc_auc_score(all_labels, all_probs) if len(set(all_labels)) > 1 else 0.0
+    # AUC requires both classes and variance in predictions
+    unique_labels = set(all_labels)
+    unique_probs = set(np.round(all_probs, 6))  # Round to avoid floating point noise
+    if len(unique_labels) < 2:
+        auc = 0.0  # No variance in labels
+    elif len(unique_probs) < 2:
+        auc = 0.5  # No variance in predictions (random)
+    else:
+        auc = roc_auc_score(all_labels, all_probs)
     return avg_loss, acc, f1, auc, all_labels, all_preds, all_probs
 
 
@@ -419,6 +448,13 @@ def main():
         test_df  = df_all.iloc[list(test_idx)].reset_index(drop=True)
 
     print(f"  Train: {len(train_df)} | Val: {len(val_df)} | Test: {len(test_df)}")
+    # Log class distribution for sanity check
+    train_class_dist = train_df["label"].value_counts().to_dict()
+    val_class_dist = val_df["label"].value_counts().to_dict()
+    test_class_dist = test_df["label"].value_counts().to_dict()
+    print(f"  Train class dist: {train_class_dist}")
+    print(f"  Val class dist: {val_class_dist}")
+    print(f"  Test class dist: {test_class_dist}")
 
     # ── DataLoaders ──────────────────────────────────────────────────────────
     print("[3/6] Building DataLoaders...")
@@ -442,8 +478,12 @@ def main():
 
     # Class weights for imbalance (benign > malignant in Mendeley)
     class_counts = train_df["label"].value_counts().sort_index()
+    # Ensure both classes (0 and 1) are present, default to 0 if missing
+    class_0_count = class_counts.get(0, 0)
+    class_1_count = class_counts.get(1, 0)
+    # Avoid division by zero - use a small epsilon if a class has no samples
     class_weights = torch.tensor(
-        [1.0 / class_counts[i] for i in range(2)], dtype=torch.float
+        [1.0 / max(class_0_count, 1), 1.0 / max(class_1_count, 1)], dtype=torch.float
     ).to(DEVICE)
     class_weights = class_weights / class_weights.sum() * 2  # normalise
     criterion = nn.CrossEntropyLoss(weight=class_weights)
@@ -467,7 +507,8 @@ def main():
 
     # ── Training loop ────────────────────────────────────────────────────────
     print(f"\n[5/6] Training for up to {CFG['num_epochs']} epochs...")
-    best_val_auc = 0.0
+    best_val_auc = -1.0  # Use -1.0 so first epoch (AUC >= 0) will always be best
+    best_epoch = 0
     patience_ctr = 0
     history      = []
 
@@ -491,6 +532,7 @@ def main():
         is_best = vl_auc > best_val_auc
         if is_best:
             best_val_auc = vl_auc
+            best_epoch = epoch
             torch.save(model.state_dict(), CKPT_BEST)
             patience_ctr = 0
         else:

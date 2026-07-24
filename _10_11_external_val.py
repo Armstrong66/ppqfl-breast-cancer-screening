@@ -27,11 +27,13 @@ Outputs (../ppqfl-breast-cancer-screening/outputs/external_val_outputs/):
 =============================================================================
 """
 
-import json, pickle, warnings
+import json, pickle, re, warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import seaborn as sns
@@ -48,8 +50,9 @@ import pennylane as qml
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.metrics import (
-    roc_auc_score, f1_score, accuracy_score,
-    confusion_matrix, classification_report, roc_curve
+    roc_auc_score, average_precision_score, matthews_corrcoef,
+    f1_score, accuracy_score, confusion_matrix,
+    classification_report, roc_curve
 )
 
 warnings.filterwarnings("ignore")
@@ -73,11 +76,40 @@ UQ_DIR       = BASE / "uq_outputs"
 OUT_DIR      = BASE / "external_val_outputs"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def auto_detect_best_vqc_config(ckpt_dir: Path) -> tuple:
+    manifest = ckpt_dir / "best_run_manifest.json"
+    if manifest.exists():
+        with open(manifest) as f:
+            m = json.load(f)
+        return int(m.get("n_qubits", 4)), int(m.get("n_layers", 2)), float(m.get("lr", 0.01))
+
+    best_config = None
+    best_auc = -1.0
+    for ckpt in sorted(ckpt_dir.glob("vqc_q*_l*_lr*.pt")):
+        match = re.match(r"vqc_q(\d+)_l(\d+)_lr([\d.]+)\.pt", ckpt.name)
+        if not match:
+            continue
+        nq, nl, lr = int(match.group(1)), int(match.group(2)), float(match.group(3))
+        history = ckpt_dir / f"vqc_q{nq}_l{nl}_lr{lr}_history.csv"
+        if history.exists():
+            try:
+                auc = pd.read_csv(history)["val_auc"].max()
+                if auc > best_auc:
+                    best_auc = auc
+                    best_config = (nq, nl, lr)
+            except Exception:
+                continue
+    if best_config is not None:
+        return best_config
+
+    print("  [WARN] Could not auto-detect best VQC config from manifest or history. "
+          "Falling back to defaults q=4, l=2, lr=0.01.")
+    return 4, 2, 0.01
+
 # ── Match to best config from _3–5 sweep (this is also need to auto_detect) ─────────────────────────────────
 BACKBONE      = "mobilenetv2"
-N_QUBITS      = 4
-N_LAYERS      = 2
-VQC_LR        = 0.01
+N_QUBITS, N_LAYERS, VQC_LR = auto_detect_best_vqc_config(VQC_DIR_A)
 BATCH_SIZE    = 32
 DEVICE        = torch.device("cpu")
 
@@ -180,13 +212,23 @@ def evaluate_vqc_on_kau(model, X_kau_scaled, y_kau):
     probs = model(X_t).numpy()
     preds = (probs > 0.5).astype(int)
     auc   = roc_auc_score(y_kau, probs) if len(set(y_kau)) > 1 else 0.0
+    ap    = average_precision_score(y_kau, probs) if len(set(y_kau)) > 1 else 0.0
+    mcc   = matthews_corrcoef(y_kau, preds) if len(set(y_kau)) > 1 else 0.0
     f1    = f1_score(y_kau, preds, zero_division=0)
     acc   = accuracy_score(y_kau, preds)
     report = classification_report(
         y_kau, preds, target_names=["Benign", "Malignant"], output_dict=True
     )
-    return {"auc": round(auc,4), "f1": round(f1,4), "accuracy": round(acc,4),
-            "per_class": report, "probs": probs, "preds": preds}
+    return {
+        "auc": round(auc,4),
+        "average_precision": round(ap,4),
+        "mcc": round(mcc,4),
+        "f1": round(f1,4),
+        "accuracy": round(acc,4),
+        "per_class": report,
+        "probs": probs,
+        "preds": preds,
+    }
 
 
 @torch.no_grad()
@@ -203,13 +245,23 @@ def evaluate_cnn_on_kau(model, X_kau_raw, y_kau):
     probs = np.array(all_probs)
     preds = np.array(all_preds)
     auc   = roc_auc_score(y_kau, probs) if len(set(y_kau)) > 1 else 0.0
+    ap    = average_precision_score(y_kau, probs) if len(set(y_kau)) > 1 else 0.0
+    mcc   = matthews_corrcoef(y_kau, preds) if len(set(y_kau)) > 1 else 0.0
     f1    = f1_score(y_kau, preds, zero_division=0)
     acc   = accuracy_score(y_kau, preds)
     report = classification_report(
         y_kau, preds, target_names=["Benign", "Malignant"], output_dict=True
     )
-    return {"auc": round(auc,4), "f1": round(f1,4), "accuracy": round(acc,4),
-            "per_class": report, "probs": probs, "preds": preds}
+    return {
+        "auc": round(auc,4),
+        "average_precision": round(ap,4),
+        "mcc": round(mcc,4),
+        "f1": round(f1,4),
+        "accuracy": round(acc,4),
+        "per_class": report,
+        "probs": probs,
+        "preds": preds,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -893,6 +945,8 @@ def main():
             name: {
                 "mendeley_auc": mendeley_results.get(name, {}).get("auc", "—"),
                 "kau_auc":      kau_results[name]["auc"],
+                "kau_average_precision": kau_results[name]["average_precision"],
+                "kau_mcc":      kau_results[name]["mcc"],
                 "kau_f1":       kau_results[name]["f1"],
                 "kau_sensitivity": kau_results[name]["per_class"].get(
                     "Malignant", {}).get("recall", "—"),
