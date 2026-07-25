@@ -62,7 +62,8 @@ seed_everything(42)
 def find_mendeley_root() -> Path:
     """Auto-detect the Mendeley dataset root directory.
 
-    Searches relative to this script's location for the dataset.
+    Searches relative to this script's location first, then checks
+    common absolute paths used on server environments.
     """
     script_dir = Path(__file__).resolve().parent
     relative_paths = [
@@ -71,13 +72,18 @@ def find_mendeley_root() -> Path:
         Path("./Breast Cancer Dataset/Breast Cancer Original"),
         Path("../Breast Cancer Dataset/Breast Cancer Original"),
     ]
-    for p in relative_paths:
+    # Server paths as fallback
+    server_paths = [
+        Path("/data/derrick/mendeley/Breast Cancer Dataset/Breast Cancer Original"),
+        Path("/data/derrick/mendeley/Breast Cancer Original"),
+    ]
+    for p in relative_paths + server_paths:
         if p.exists() and (p / "Benign").exists() and (p / "Malignant").exists():
             return p.resolve()
     raise FileNotFoundError(
-        f"Mendeley dataset not found. Searched relative paths:\n"
-        f"  " + "\n  ".join(str(p) for p in relative_paths) + "\n"
-        f"Ensure the dataset is located at one of these paths with Benign/ and Malignant/ subfolders."
+        f"Mendeley dataset not found. Searched:\n"
+        f"  Relative paths:\n    " + "\n    ".join(str(p) for p in relative_paths) + "\n"
+        f"  Server paths:\n    " + "\n    ".join(str(p) for p in server_paths)
     )
 
 ROOT_MENDELEY = find_mendeley_root()

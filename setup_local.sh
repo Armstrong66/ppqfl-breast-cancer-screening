@@ -28,8 +28,8 @@ OUTPUT_DIR="${SCRIPT_DIR}/outputs"
 
 # Where your dataset files live (the two datasets)
 # Expected sub-structure:
-#   DATA_DIR/mendeley/Breast Cancer Original/Benign/
-#   DATA_DIR/mendeley/Breast Cancer Original/Malignant/
+#   DATA_DIR/mendeley/Breast Cancer Dataset/Breast Cancer Original/Benign/
+#   DATA_DIR/mendeley/Breast Cancer Dataset/Breast Cancer Original/Malignant/
 #   DATA_DIR/kau/BIRAD1/b1/  etc.
 # Default: looks for dataset relative to script location first
 # You can override with: ./setup_local.sh --data-dir /path/to/your/data
@@ -39,10 +39,13 @@ DATA_DIR="${DATA_DIR:-}"
 # Auto-detect path if not provided
 if [[ -z "$DATA_DIR" ]] || [[ ! -d "$DATA_DIR/mendeley" && ! -d "$DATA_DIR/kau" ]]; then
     # Check if datasets exist relative to script location
-    if [[ -d "$SCRIPT_DIR_ABS/../Breast Cancer Dataset" ]]; then
-        DATA_DIR="$SCRIPT_DIR_ABS/../.."
-    elif [[ -d "$SCRIPT_DIR_ABS/Breast Cancer Dataset" ]]; then
+    if [[ -d "$SCRIPT_DIR_ABS/Breast Cancer Dataset" ]]; then
+        DATA_DIR="$SCRIPT_DIR_ABS"
+    elif [[ -d "$SCRIPT_DIR_ABS/../Breast Cancer Dataset" ]]; then
         DATA_DIR="$SCRIPT_DIR_ABS/.."
+    elif [[ -d "/data/derrick/mendeley/Breast Cancer Dataset/Breast Cancer Original" ]]; then
+        # Server path
+        DATA_DIR="/data/derrick"
     else
         echo "ERROR: Cannot locate dataset directories."
         echo "Please provide the data directory with: ./setup_local.sh --data-dir /path/to/data"
