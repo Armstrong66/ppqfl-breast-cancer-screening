@@ -138,15 +138,52 @@ if torch.cuda.is_available():
 
 SUPPORTED_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
+# Reuse the mask detection logic from _1_eda.py
+MASK_FOLDER_HINTS = {
+    "mask", "masks", "segmentation", "segmentations",
+    "ground_truth", "groundtruth", "gt",
+}
+MASK_FILENAME_HINTS = {
+    "mask", "segmentation", "segmentations",
+    "ground_truth", "groundtruth", "gt",
+}
+
+def is_mask_path(path: Path) -> bool:
+    """Detect mask/segmentation derivative files by folder structure or filename hints."""
+    parts = [part.lower() for part in path.parts[:-1]]
+    if any(any(hint in part for hint in MASK_FOLDER_HINTS) for part in parts):
+        return True
+    stem = path.stem.lower()
+    return any(hint in stem for hint in MASK_FILENAME_HINTS)
+
 def collect_paths(benign_dir: Path, malignant_dir: Path):
+    """Collect image paths, excluding binary mask files."""
     records = []
+    skipped_mask_folder = 0
+    skipped_binary_mode = 0
     for label_int, label, directory in [
         (0, "Benign",    benign_dir),
         (1, "Malignant", malignant_dir),
     ]:
         for f in directory.rglob("*"):
-            if f.suffix.lower() in SUPPORTED_EXT:
-                records.append({"path": str(f), "label": label_int})
+            if f.suffix.lower() not in SUPPORTED_EXT:
+                continue
+            # Skip mask/segmentation files
+            if is_mask_path(f):
+                skipped_mask_folder += 1
+                continue
+            try:
+                with Image.open(f) as img:
+                    if img.mode == "1":
+                        skipped_binary_mode += 1
+                        continue
+            except Exception:
+                pass  # Keep corrupt files for audit later
+            records.append({"path": str(f), "label": label_int})
+    if skipped_mask_folder > 0:
+        print(f"  Skipped {skipped_mask_folder} mask/segmentation files")
+    if skipped_binary_mode > 0:
+        print(f"  Skipped {skipped_binary_mode} binary mode mask files")
     return pd.DataFrame(records)
 
 
@@ -577,8 +614,22 @@ def main():
     print(f"  Accuracy : {ts_acc:.4f}")
     print(f"  F1-score : {ts_f1:.4f}")
     print(f"  AUC-ROC  : {ts_auc:.4f}")
-    print(f"\n  Full classification report:")
-    print(classification_report(y_true, y_pred, target_names=["Benign", "Malignant"]))
+    # Count unique classes in test set
+    unique_classes = set(y_true)
+    print(f"\n  Test set unique classes: {sorted(unique_classes)}")
+    if len(unique_classes) >= 2:
+        print(f"\n  Full classification report:")
+        print(classification_report(y_true, y_pred, target_names=["Benign", "Malignant"]))
+    else:
+        print(f"\n  Classification report skipped: only {len(unique_classes)} class(es) in test set")
+        # Still compute precision/recall/f1 for the single class
+        from sklearn.metrics import precision_score, recall_score
+        if len(unique_classes) == 1:
+            unique_class = list(unique_classes)[0]
+            precision = precision_score(y_true, y_pred, pos_label=unique_class, zero_division=0)
+            recall = recall_score(y_true, y_pred, pos_label=unique_class, zero_division=0)
+            print(f"  Precision (class {unique_class}): {precision:.4f}")
+            print(f"  Recall (class {unique_class}): {recall:.4f}")
 
     plot_confusion_matrix(y_true, y_pred, title="Mendeley Test Set")
     plot_roc_curve(y_true, y_probs)
