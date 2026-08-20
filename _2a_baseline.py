@@ -165,9 +165,8 @@ def collect_paths(benign_dir: Path, malignant_dir: Path):
         (0, "Benign",    benign_dir),
         (1, "Malignant", malignant_dir),
     ]:
-        for f in directory.rglob("*"):
-            if f.suffix.lower() not in SUPPORTED_EXT:
-                continue
+        files = sorted([f for f in directory.rglob("*") if f.suffix.lower() in SUPPORTED_EXT], key=lambda p: str(p))
+        for f in files:
             # Skip mask/segmentation files
             if is_mask_path(f):
                 skipped_mask_folder += 1

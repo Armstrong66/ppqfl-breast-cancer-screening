@@ -159,7 +159,7 @@ def collect_image_paths(benign_dir: Path, malignant_dir: Path,
             print(f"  [WARNING] Directory not found: {directory}")
             print("  → Update the path constants at the top of this script.")
             continue
-        files = [f for f in directory.rglob("*") if f.suffix.lower() in SUPPORTED_EXT]
+        files = sorted([f for f in directory.rglob("*") if f.suffix.lower() in SUPPORTED_EXT], key=lambda p: str(p))
         for f in files:
             if is_mask_path(f):
                 skipped_mask_folder += 1
@@ -229,7 +229,7 @@ def collect_kau_paths(birad_map: dict, dataset_name: str = "KAU-BCMD") -> pd.Dat
             if not directory.exists():
                 print(f"  [WARNING] KAU dir not found: {directory}")
                 continue
-            files = [f for f in directory.rglob("*") if f.suffix.lower() in SUPPORTED_EXT]
+            files = sorted([f for f in directory.rglob("*") if f.suffix.lower() in SUPPORTED_EXT], key=lambda p: str(p))
             for f in files:
                 if is_mask_path(f):
                     skipped_mask_folder += 1

@@ -199,19 +199,19 @@ def collect_paths(benign_dir: Path, malignant_dir: Path) -> pd.DataFrame:
     skipped_mask_folder = 0
     skipped_binary_mode = 0
     for label_int, directory in [(0, benign_dir), (1, malignant_dir)]:
-        for f in directory.rglob("*"):
-            if f.suffix.lower() in SUPPORTED_EXT:
-                if is_mask_path(f):
-                    skipped_mask_folder += 1
-                    continue
-                try:
-                    with Image.open(f) as img:
-                        if img.mode == "1":
-                            skipped_binary_mode += 1
-                            continue
-                except Exception:
-                    pass  # Keep corrupt files for audit later
-                records.append({"path": str(f), "label": label_int})
+        files = sorted([f for f in directory.rglob("*") if f.suffix.lower() in SUPPORTED_EXT], key=lambda p: str(p))
+        for f in files:
+            if is_mask_path(f):
+                skipped_mask_folder += 1
+                continue
+            try:
+                with Image.open(f) as img:
+                    if img.mode == "1":
+                        skipped_binary_mode += 1
+                        continue
+            except Exception:
+                pass  # Keep corrupt files for audit later
+            records.append({"path": str(f), "label": label_int})
     if skipped_mask_folder > 0:
         print(f"  Skipped {skipped_mask_folder} mask/segmentation files")
     if skipped_binary_mode > 0:
@@ -228,12 +228,12 @@ def collect_kau_paths(birad_map: dict) -> pd.DataFrame:
             if not directory.exists():
                 print(f"  [WARNING] KAU dir not found: {directory}")
                 continue
-            for f in directory.rglob("*"):
-                if f.suffix.lower() in SUPPORTED_EXT:
-                    if is_mask_path(f):
-                        skipped_mask_folder += 1
-                        continue
-                    records.append({"path": str(f), "label": label_int})
+            files = sorted([f for f in directory.rglob("*") if f.suffix.lower() in SUPPORTED_EXT], key=lambda p: str(p))
+            for f in files:
+                if is_mask_path(f):
+                    skipped_mask_folder += 1
+                    continue
+                records.append({"path": str(f), "label": label_int})
     if skipped_mask_folder > 0:
         print(f"  Skipped {skipped_mask_folder} KAU mask/segmentation files")
     return pd.DataFrame(records)

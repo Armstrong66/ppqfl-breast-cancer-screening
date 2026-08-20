@@ -458,6 +458,7 @@ def run_classical_control_configs(n_features: int = 4) -> list:
         "test_accuracy": round(accuracy_score(y_test, test_preds), 4),
         "notes": "Classical micro-MLP control (≈9–11 params)",
     })
+    return results
 
 
 def _select_hidden_dim_for_budget(target_params: int, input_dim: int = 4) -> int:
