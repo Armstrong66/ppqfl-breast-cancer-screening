@@ -11,7 +11,7 @@ MOCK_FEAT_DIR = BASE_DIR / "feature_outputs"
 
 print("Step 1: Synchronizing Mock Feature Data arrays for Test Coverage...")
 MOCK_FEAT_DIR.mkdir(parents=True, exist_ok=True)
-for q in:
+for q in [4]:
     np.save(MOCK_FEAT_DIR / f"features_train_pca{q}.npy", np.random.rand(10, q))
     np.save(MOCK_FEAT_DIR / f"features_val_pca{q}.npy",   np.random.rand(5, q))
     np.save(MOCK_FEAT_DIR / f"features_test_pca{q}.npy",  np.random.rand(5, q))
@@ -19,13 +19,13 @@ np.save(MOCK_FEAT_DIR / "labels_train.npy", np.random.randint(0, 2, 10))
 np.save(MOCK_FEAT_DIR / "labels_val.npy",   np.random.randint(0, 2, 5))
 np.save(MOCK_FEAT_DIR / "labels_test.npy",  np.random.randint(0, 2, 5))
 
-print("Step 2: Hot-patching 3_5_vqc execution parameters to run instantly...")
-import 3_5_vqc as vqc  # this may fail. watch out
+print("Step 2: Hot-patching _3_5_vqc execution parameters to run instantly...")
+import _3_5_vqc as vqc
 
 # Restrict the grid parameters down to minimum elements for fast execution
 vqc.SWEEP_CFG = {
-    "n_qubits":,
-    "n_layers":,
+    "n_qubits": [4],
+    "n_layers": [2],
     "encoding": ["angle"],
     "lr":       [0.01]
 }

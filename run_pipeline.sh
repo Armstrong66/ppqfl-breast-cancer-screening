@@ -238,7 +238,7 @@ apply_skip_slow() {
     local tmp_script="/tmp/3_5_vqc_slim_${TIMESTAMP}.py"
     $PYTHON - <<EOF
 import pathlib
-p   = pathlib.Path("3_5_vqc.py")
+p   = pathlib.Path("_3_5_vqc.py")
 txt = p.read_text()
 txt = txt.replace('"n_qubits":    [4, 6],',        '"n_qubits":    [4],')
 txt = txt.replace('"n_layers":    [1, 2, 3],',     '"n_layers":    [2],')
@@ -246,8 +246,8 @@ txt = txt.replace('"lr":          [0.01, 0.005],', '"lr":          [0.01],')
 pathlib.Path("${tmp_script}").write_text(txt)
 print("  Slim config written to: ${tmp_script}")
 EOF
-    STAGE_SCRIPTS["3_5_vqc"]="$tmp_script"
-    log_info "3_5_vqc will run from: $tmp_script"
+    STAGE_SCRIPTS["_3_5_vqc"]="$tmp_script"
+    log_info "_3_5_vqc will run from: $tmp_script"
 }
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
