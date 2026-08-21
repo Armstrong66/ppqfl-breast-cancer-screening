@@ -71,7 +71,7 @@ from torchvision.models import MobileNet_V2_Weights
 import pennylane as qml
 
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
+from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, average_precision_score
 from sklearn.calibration import calibration_curve
 
 from pipeline_utils import seed_everything
@@ -825,19 +825,20 @@ def main():
     print(f"\n[3/7] MC-Dropout ({MC_T} passes)...")
     mc_mean, mc_std, mc_all = mc_dropout_predict(cnn_head, X_raw_t, T=MC_T)
     mc_auc  = roc_auc_score(y_test, mc_mean)
+    mc_aupr = average_precision_score(y_test, mc_mean) if len(set(y_test)) > 1 else 0.0
     mc_ece  = plot_reliability_diagram(
         y_test, mc_mean,
-        title=f"Classical MobileNetV2 — MC-Dropout (T={MC_T})\nAUC={mc_auc:.4f}",
+        title=f"Classical MobileNetV2 — MC-Dropout (T={MC_T})\nAUC={mc_auc:.4f} AUPR={mc_aupr:.4f}",
         save_path=OUT_DIR / "reliability_diagram_classical.png",
         uncertainty=mc_std
     )
     pd.DataFrame({
         "y_true": y_test, "mc_mean_prob": mc_mean, "mc_std": mc_std
-    }).to_csv(OUT_DIR / "mc_dropout_uncertainty.csv", index=False)
-    print(f"  MC-Dropout — AUC: {mc_auc:.4f}  ECE: {mc_ece:.4f}  "
+    }).to_csv(OUT_DIR / "mc_dropout_uncertainty.csv", index=False, encoding="utf-8-sig")
+    print(f"  MC-Dropout — AUC: {mc_auc:.4f}  AUPR: {mc_aupr:.4f}  ECE: {mc_ece:.4f}  "
           f"Mean uncertainty: {mc_std.mean():.4f}")
     summary["classical_mc_dropout"] = {
-        "auc": round(mc_auc, 4), "ece": round(mc_ece, 4),
+        "auc": round(mc_auc, 4), "aupr": round(mc_aupr, 4), "ece": round(mc_ece, 4),
         "mean_uncertainty": round(float(mc_std.mean()), 6),
         "T": MC_T
     }
@@ -848,20 +849,21 @@ def main():
         vqc_model, X_test_q, n_repeats=20, n_shots=N_SHOTS
     )
     q_auc = roc_auc_score(y_test, q_mean)
+    q_aupr = average_precision_score(y_test, q_mean) if len(set(y_test)) > 1 else 0.0
     q_ece = plot_reliability_diagram(
         y_test, q_mean,
         title=(f"HQCNN VQC q={VQC_N_QUBITS} l={VQC_N_LAYERS} — "
-               f"Shot Variance (shots={N_SHOTS})\nAUC={q_auc:.4f}"),
+               f"Shot Variance (shots={N_SHOTS})\nAUC={q_auc:.4f} AUPR={q_aupr:.4f}"),
         save_path=OUT_DIR / "reliability_diagram_quantum.png",
         uncertainty=np.sqrt(q_var)
     )
     pd.DataFrame({
         "y_true": y_test, "q_mean_prob": q_mean, "q_var": q_var
-    }).to_csv(OUT_DIR / "quantum_shot_variance.csv", index=False)
-    print(f"  Quantum — AUC: {q_auc:.4f}  ECE: {q_ece:.4f}  "
+    }).to_csv(OUT_DIR / "quantum_shot_variance.csv", index=False, encoding="utf-8-sig")
+    print(f"  Quantum — AUC: {q_auc:.4f}  AUPR: {q_aupr:.4f}  ECE: {q_ece:.4f}  "
           f"Mean shot var: {q_var.mean():.6f}")
     summary["quantum_shot_variance"] = {
-        "auc": round(q_auc, 4), "ece": round(q_ece, 4),
+        "auc": round(q_auc, 4), "aupr": round(q_aupr, 4), "ece": round(q_ece, 4),
         "mean_shot_variance": round(float(q_var.mean()), 8),
         "n_shots": N_SHOTS, "n_repeats": 20
     }
@@ -869,7 +871,7 @@ def main():
     # ── UQ under noise ────────────────────────────────────────────────────
     print("\n[5/7] UQ under scanner noise...")
     noise_df = uq_under_noise(vqc_model, cnn_head, X_raw_t, y_test)
-    noise_df.to_csv(OUT_DIR / "uq_under_noise.csv", index=False)
+    noise_df.to_csv(OUT_DIR / "uq_under_noise.csv", index=False, encoding="utf-8-sig")
     plot_uq_vs_noise(noise_df, OUT_DIR / "uncertainty_vs_noise.png")
     summary["uq_under_noise"] = noise_df.to_dict(orient="records")
 
@@ -890,6 +892,7 @@ def main():
         vqc_model, X_val_scaled, y_val)
     ece_after  = expected_calibration_error(y_test, probs_scaled)
     auc_scaled = roc_auc_score(y_test, logits_scaled)
+    aupr_scaled = average_precision_score(y_test, probs_scaled) if len(set(y_test)) > 1 else 0.0
     print(f"  Optimal T     : {T_opt:.4f}  "
           f"({'overconfident → softened' if T_opt > 1 else 'underconfident → sharpened'})")
     print(f"  ECE before    : {q_ece:.4f}")
@@ -905,13 +908,14 @@ def main():
         "y_true": y_test,
         "q_prob_raw": vqc_probs,
         "q_prob_scaled": probs_scaled,
-    }).to_csv(OUT_DIR / "temperature_scaled_probs.csv", index=False)
+    }).to_csv(OUT_DIR / "temperature_scaled_probs.csv", index=False, encoding="utf-8-sig")
 
     summary["temperature_scaling"] = {
         "T_optimal":  round(T_opt, 4),
         "ece_before": round(q_ece,     4),
         "ece_after":  round(ece_after, 4),
         "auc_scaled": round(auc_scaled, 4),
+        "aupr_scaled": round(aupr_scaled, 4),
         "note": ("T > 1 means VQC was overconfident; "
                  "temperature scaling softens sigmoid outputs. "
                  "AUC is invariant to monotone rescaling — "

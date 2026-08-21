@@ -52,7 +52,8 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, matthews_corrcoef,
     f1_score, accuracy_score, confusion_matrix,
-    classification_report, roc_curve
+    classification_report, roc_curve, brier_score_loss,
+    balanced_accuracy_score
 )
 
 warnings.filterwarnings("ignore")
@@ -171,6 +172,49 @@ def build_mobilenet(ckpt_path):
     return base
 
 
+class ClassicalMicroMLP(nn.Module):
+    def __init__(self, in_dim: int):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, 2)
+        self.fc2 = nn.Linear(2, 1)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        return torch.sigmoid(self.fc2(x)).view(-1)
+
+    def count_params(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+def load_or_train_micromlp(in_dim: int, X_train_scaled, y_train):
+    """Load trained micro-MLP checkpoint or fit quickly on training features."""
+    seed_everything(42)
+    model = ClassicalMicroMLP(in_dim)
+    ckpt = VQC_DIR_A.parent / "micromlp_q4.pt"
+    if ckpt.exists():
+        try:
+            model.load_state_dict(torch.load(ckpt, map_location="cpu"))
+            print(f"  Loaded Micro-MLP checkpoint: {ckpt}")
+            model.eval()
+            return model
+        except Exception:
+            pass
+    # Fallback: train on train split
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    criterion = nn.BCELoss()
+    ds = TensorDataset(torch.tensor(X_train_scaled, dtype=torch.float32), torch.tensor(y_train, dtype=torch.float32))
+    loader = DataLoader(ds, batch_size=16, shuffle=True)
+    model.train()
+    for _ in range(30):
+        for X_b, y_b in loader:
+            optimizer.zero_grad()
+            loss = criterion(model(X_b), y_b)
+            loss.backward()
+            optimizer.step()
+    model.eval()
+    return model
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 2.  LOAD KAU FEATURES + LABELS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -206,62 +250,94 @@ def load_kau_features(n_qubits):
 # 3.  EVALUATE MODEL ON KAU
 # ══════════════════════════════════════════════════════════════════════════════
 
-@torch.no_grad()
-def evaluate_vqc_on_kau(model, X_kau_scaled, y_kau):
-    X_t   = torch.tensor(X_kau_scaled, dtype=torch.float32)
-    probs = model(X_t).numpy()
-    preds = (probs > 0.5).astype(int)
-    auc   = roc_auc_score(y_kau, probs) if len(set(y_kau)) > 1 else 0.0
-    ap    = average_precision_score(y_kau, probs) if len(set(y_kau)) > 1 else 0.0
-    mcc   = matthews_corrcoef(y_kau, preds) if len(set(y_kau)) > 1 else 0.0
-    f1    = f1_score(y_kau, preds, zero_division=0)
-    acc   = accuracy_score(y_kau, preds)
-    report = classification_report(
-        y_kau, preds, target_names=["Benign", "Malignant"], output_dict=True
-    )
+def find_optimal_threshold_youden(y_true, probs) -> float:
+    """Find optimal classification threshold maximizing Youden's J = TPR - FPR on a calibration set."""
+    if len(set(y_true)) < 2:
+        return 0.5
+    fpr, tpr, thresholds = roc_curve(y_true, probs)
+    j_scores = tpr - fpr
+    best_idx = int(np.argmax(j_scores))
+    best_thresh = float(thresholds[best_idx])
+    return float(np.clip(best_thresh, 0.05, 0.95))
+
+
+def compute_comprehensive_metrics(y_true, probs, opt_threshold: Optional[float] = None) -> dict:
+    """
+    Compute full suite of classification and calibration metrics:
+    1. Threshold-independent: AUC-ROC, PR-AUC, Brier score
+    2. Default threshold (0.5): F1, Accuracy, MCC, Sensitivity, Specificity
+    3. Optimal threshold (Youden's J): Optimal threshold, F1, Balanced Accuracy, Sensitivity, Specificity
+    """
+    y_true = np.asarray(y_true)
+    probs  = np.asarray(probs)
+    n_classes = len(set(y_true))
+
+    auc = roc_auc_score(y_true, probs) if n_classes > 1 else 0.0
+    ap  = average_precision_score(y_true, probs) if n_classes > 1 else 0.0
+    brier = float(brier_score_loss(y_true, probs))
+
+    # Standard 0.5 threshold
+    preds_05 = (probs > 0.5).astype(int)
+    f1_05    = float(f1_score(y_true, preds_05, zero_division=0))
+    acc_05   = float(accuracy_score(y_true, preds_05))
+    mcc_05   = float(matthews_corrcoef(y_true, preds_05)) if n_classes > 1 else 0.0
+    bacc_05  = float(balanced_accuracy_score(y_true, preds_05)) if n_classes > 1 else acc_05
+
+    report_05 = classification_report(
+        y_true, preds_05, target_names=["Benign", "Malignant"], output_dict=True
+    ) if n_classes > 1 else {}
+
+    # Optimal threshold (if provided or calculated)
+    tau = opt_threshold if opt_threshold is not None else find_optimal_threshold_youden(y_true, probs)
+    preds_opt = (probs > tau).astype(int)
+    f1_opt    = float(f1_score(y_true, preds_opt, zero_division=0))
+    acc_opt   = float(accuracy_score(y_true, preds_opt))
+    mcc_opt   = float(matthews_corrcoef(y_true, preds_opt)) if n_classes > 1 else 0.0
+    bacc_opt  = float(balanced_accuracy_score(y_true, preds_opt)) if n_classes > 1 else acc_opt
+    report_opt = classification_report(
+        y_true, preds_opt, target_names=["Benign", "Malignant"], output_dict=True
+    ) if n_classes > 1 else {}
+
     return {
-        "auc": round(auc,4),
-        "average_precision": round(ap,4),
-        "mcc": round(mcc,4),
-        "f1": round(f1,4),
-        "accuracy": round(acc,4),
-        "per_class": report,
+        "auc": round(auc, 4),
+        "average_precision": round(ap, 4),
+        "brier_score": round(brier, 4),
+        # 0.5 standard metrics
+        "f1": round(f1_05, 4),
+        "accuracy": round(acc_05, 4),
+        "balanced_accuracy": round(bacc_05, 4),
+        "mcc": round(mcc_05, 4),
+        "per_class": report_05,
+        # Clinical optimal threshold metrics
+        "opt_threshold": round(tau, 4),
+        "f1_at_opt": round(f1_opt, 4),
+        "balanced_acc_at_opt": round(bacc_opt, 4),
+        "per_class_at_opt": report_opt,
         "probs": probs,
-        "preds": preds,
+        "preds": preds_05,
+        "preds_at_opt": preds_opt,
     }
 
 
 @torch.no_grad()
-def evaluate_cnn_on_kau(model, X_kau_raw, y_kau):
+def evaluate_vqc_on_kau(model, X_kau_scaled, y_kau, opt_threshold: Optional[float] = None):
+    X_t   = torch.tensor(X_kau_scaled, dtype=torch.float32)
+    probs = model(X_t).numpy()
+    return compute_comprehensive_metrics(y_kau, probs, opt_threshold=opt_threshold)
+
+
+@torch.no_grad()
+def evaluate_cnn_on_kau(model, X_kau_raw, y_kau, opt_threshold: Optional[float] = None):
     X_t    = torch.tensor(X_kau_raw, dtype=torch.float32)
     loader = DataLoader(TensorDataset(X_t, torch.tensor(y_kau)),
                         batch_size=BATCH_SIZE, shuffle=False)
-    all_probs, all_preds = [], []
+    all_probs = []
     for X_b, _ in loader:
         logits = model.classifier(X_b)
         probs  = torch.softmax(logits, dim=1)[:, 1]
         all_probs.extend(probs.numpy())
-        all_preds.extend((probs > 0.5).long().numpy())
     probs = np.array(all_probs)
-    preds = np.array(all_preds)
-    auc   = roc_auc_score(y_kau, probs) if len(set(y_kau)) > 1 else 0.0
-    ap    = average_precision_score(y_kau, probs) if len(set(y_kau)) > 1 else 0.0
-    mcc   = matthews_corrcoef(y_kau, preds) if len(set(y_kau)) > 1 else 0.0
-    f1    = f1_score(y_kau, preds, zero_division=0)
-    acc   = accuracy_score(y_kau, preds)
-    report = classification_report(
-        y_kau, preds, target_names=["Benign", "Malignant"], output_dict=True
-    )
-    return {
-        "auc": round(auc,4),
-        "average_precision": round(ap,4),
-        "mcc": round(mcc,4),
-        "f1": round(f1,4),
-        "accuracy": round(acc,4),
-        "per_class": report,
-        "probs": probs,
-        "preds": preds,
-    }
+    return compute_comprehensive_metrics(y_kau, probs, opt_threshold=opt_threshold)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -525,19 +601,35 @@ def build_master_ablation(
             "ModelShort":       "Classical",
             "Category":         "Classical",
             "Regime":           bl.get("freeze_strategy", "progressive"),
-            "Qubits":           "—", "Layers": "—",
+            "Qubits":           "N/A", "Layers": "N/A",
             "TrainableParams":  bl.get("trainable_params", "N/A"),
             "NoiseSigma":       0.0, "DPSigma": 0.0,
-            "MendeleyTestAUC":  bl.get("test_auc_roc", "—"),
-            "MendeleyTestF1":   bl.get("test_f1", "—"),
-            "KAU_AUC":          kau_results_dict.get("Classical", {}).get("auc", "—"),
-            "KAU_F1":           kau_results_dict.get("Classical", {}).get("f1", "—"),
+            "MendeleyTestAUC":  bl.get("test_auc_roc", "N/A"),
+            "MendeleyTestF1":   bl.get("test_f1", "N/A"),
+            "KAU_AUC":          kau_results_dict.get("Classical", {}).get("auc", "N/A"),
+            "KAU_F1":           kau_results_dict.get("Classical", {}).get("f1", "N/A"),
             "Notes":            "Classical baseline (frozen CNN backbone)",
         })
 
+    # ── 1b. Classical Micro-MLP / Control ──────────────────────────────────
+    if "Micro-MLP" in kau_results_dict:
+        m_res = kau_results_dict["Micro-MLP"]
+        rows.append({
+            "Model":            "Micro-MLP (Classical)",
+            "ModelShort":       "Micro-MLP",
+            "Category":         "Classical Control",
+            "Regime":           "Classical micro-model on PCA features",
+            "Qubits":           N_QUBITS, "Layers": 0,
+            "TrainableParams":  N_QUBITS + 1,
+            "NoiseSigma":       0.0, "DPSigma": 0.0,
+            "MendeleyTestAUC":  m_res.get("mendeley_auc", "N/A"),
+            "MendeleyTestF1":   m_res.get("mendeley_f1", "N/A"),
+            "KAU_AUC":          m_res.get("auc", "N/A"),
+            "KAU_F1":           m_res.get("f1", "N/A"),
+            "Notes":            "Classical linear probe / micro-model (parameter-matched control)",
+        })
+
     # ── 2. VQC Regime A primary results (best config per qubit count) ────────
-    # Pull actual test metrics from the ablation_table.csv produced by
-    # 3_5_vqc.py rather than the history CSVs (which have val AUC only).
     ablation_csv = vqc_dir_A.parent / "ablation_table.csv"
     seen_regime_A = set()  # deduplicate by (nq, nl)
 
@@ -562,11 +654,32 @@ def build_master_ablation(
                 "Qubits":          nq, "Layers": nl,
                 "TrainableParams": nq * nl + 1,
                 "NoiseSigma":      0.0, "DPSigma": 0.0,
-                "MendeleyTestAUC": r.get("TestAUC", "—"),
-                "MendeleyTestF1":  r.get("TestF1",  "—"),
-                "KAU_AUC":         kau_results_dict.get(label, {}).get("auc", "—"),
-                "KAU_F1":          kau_results_dict.get(label, {}).get("f1", "—"),
+                "MendeleyTestAUC": r.get("TestAUC", "N/A"),
+                "MendeleyTestF1":  r.get("TestF1",  "N/A"),
+                "KAU_AUC":         kau_results_dict.get(label, {}).get("auc", "N/A"),
+                "KAU_F1":          kau_results_dict.get(label, {}).get("f1", "N/A"),
                 "Notes":           "Regime A primary",
+            })
+        
+        # Also include classical control rows from ablation_table.csv if present
+        ctrl_rows = df_abl[df_abl["Regime"].str.contains("control|param-matched", case=False, na=False)]
+        for _, r in ctrl_rows.iterrows():
+            m_name = str(r.get("Model", "Classical Control"))
+            rows.append({
+                "Model":           m_name,
+                "ModelShort":      m_name[:15],
+                "Category":        "Classical Control",
+                "Regime":          str(r.get("Regime", "Classical control")),
+                "Qubits":          r.get("Qubits", "N/A"),
+                "Layers":          r.get("Layers", "N/A"),
+                "TrainableParams": r.get("TrainableParams", "N/A"),
+                "NoiseSigma":      r.get("NoiseSigma", 0.0),
+                "DPSigma":         0.0,
+                "MendeleyTestAUC": r.get("TestAUC", "N/A"),
+                "MendeleyTestF1":  r.get("TestF1",  "N/A"),
+                "KAU_AUC":         kau_results_dict.get(m_name, {}).get("auc", "N/A"),
+                "KAU_F1":          kau_results_dict.get(m_name, {}).get("f1", "N/A"),
+                "Notes":           str(r.get("Notes", "Classical control baseline")),
             })
     else:
         # Fallback: parse history CSVs, deduplicate
@@ -592,10 +705,10 @@ def build_master_ablation(
                 "Qubits":          nq, "Layers": nl,
                 "TrainableParams": nq * nl + 1,
                 "NoiseSigma":      0.0, "DPSigma": 0.0,
-                "MendeleyTestAUC": "—",
-                "MendeleyTestF1":  "—",
-                "KAU_AUC":         kau_results_dict.get(label, {}).get("auc", "—"),
-                "KAU_F1":          kau_results_dict.get(label, {}).get("f1", "—"),
+                "MendeleyTestAUC": "N/A",
+                "MendeleyTestF1":  "N/A",
+                "KAU_AUC":         kau_results_dict.get(label, {}).get("auc", "N/A"),
+                "KAU_F1":          kau_results_dict.get(label, {}).get("f1", "N/A"),
                 "Notes":           f"Regime A, lr={lr}",
             })
 
@@ -613,7 +726,7 @@ def build_master_ablation(
             continue
         seen_regime_B.add(key)
         df_h  = pd.read_csv(hist_csv)
-        best_auc = df_h["val_auc"].max() if "val_auc" in df_h.columns else "—"
+        best_auc = df_h["val_auc"].max() if "val_auc" in df_h.columns else "N/A"
         label = f"HQCNN q={nq} l={nl} (Regime B)"
         rows.append({
             "Model":           label,
@@ -623,10 +736,10 @@ def build_master_ablation(
             "Qubits":          nq, "Layers": nl,
             "TrainableParams": nq * nl + 1 + nq * nq,  # VQC + projection layer
             "NoiseSigma":      0.0, "DPSigma": 0.0,
-            "MendeleyTestAUC": "—",
-            "MendeleyTestF1":  "—",
-            "KAU_AUC":         kau_results_dict.get(label, {}).get("auc", "—"),
-            "KAU_F1":          kau_results_dict.get(label, {}).get("f1", "—"),
+            "MendeleyTestAUC": "N/A",
+            "MendeleyTestF1":  "N/A",
+            "KAU_AUC":         kau_results_dict.get(label, {}).get("auc", "N/A"),
+            "KAU_F1":          kau_results_dict.get(label, {}).get("f1", "N/A"),
             "Notes":           f"Regime B, best val AUC={best_auc:.4f}" if isinstance(best_auc, float) else "Regime B",
         })
 
@@ -651,9 +764,9 @@ def build_master_ablation(
                         "Qubits":          nq, "Layers": nl,
                         "TrainableParams": nq * nl + 1,
                         "NoiseSigma":      0.0, "DPSigma": 0.0,
-                        "MendeleyTestAUC": r.get("TestAUC", "—"),
-                        "MendeleyTestF1":  r.get("TestF1", "—"),
-                        "KAU_AUC":         "—", "KAU_F1": "—",
+                        "MendeleyTestAUC": r.get("TestAUC", "N/A"),
+                        "MendeleyTestF1":  r.get("TestF1", "N/A"),
+                        "KAU_AUC":         "N/A", "KAU_F1": "N/A",
                         "Notes":           "Best sweep config per qubit count",
                     })
             except Exception:
@@ -696,9 +809,9 @@ def build_master_ablation(
             "Qubits":          N_QUBITS, "Layers": N_LAYERS,
             "TrainableParams": N_QUBITS * N_LAYERS + 1,
             "NoiseSigma":      0.0, "DPSigma": 0.0,
-            "MendeleyTestAUC": ua.get("centralised_test_auc", "—"),
-            "MendeleyTestF1":  ua.get("centralised_test_f1", "—"),
-            "KAU_AUC":         "—", "KAU_F1": "—",
+            "MendeleyTestAUC": ua.get("centralised_test_auc", "N/A"),
+            "MendeleyTestF1":  ua.get("centralised_test_f1", "N/A"),
+            "KAU_AUC":         "N/A", "KAU_F1": "N/A",
             "Notes":           "Centralised VQC; same gradient steps as QFL",
         })
         # QFL no-DP row
@@ -710,11 +823,11 @@ def build_master_ablation(
             "Qubits":          N_QUBITS, "Layers": N_LAYERS,
             "TrainableParams": N_QUBITS * N_LAYERS + 1,
             "NoiseSigma":      0.0, "DPSigma": 0.0,
-            "MendeleyTestAUC": ua.get("federated_test_auc", "—"),
-            "MendeleyTestF1":  ua.get("federated_test_f1", "—"),
-            "KAU_AUC":         kau_results_dict.get("QFL", {}).get("auc", "—"),
-            "KAU_F1":          kau_results_dict.get("QFL", {}).get("f1", "—"),
-            "Notes":           f"Utility gap vs centralised: {ua.get('auc_utility_gap','—')}",
+            "MendeleyTestAUC": ua.get("federated_test_auc", "N/A"),
+            "MendeleyTestF1":  ua.get("federated_test_f1", "N/A"),
+            "KAU_AUC":         kau_results_dict.get("QFL", {}).get("auc", "N/A"),
+            "KAU_F1":          kau_results_dict.get("QFL", {}).get("f1", "N/A"),
+            "Notes":           f"Utility gap vs centralised: {ua.get('auc_utility_gap','N/A')}",
         })
         # DP sweep rows
         for dp_r in qfl.get("dp_analysis", {}).get("all_dp_results", []):
@@ -728,9 +841,9 @@ def build_master_ablation(
                 "Qubits":          N_QUBITS, "Layers": N_LAYERS,
                 "TrainableParams": N_QUBITS * N_LAYERS + 1,
                 "NoiseSigma":      0.0, "DPSigma": dp_r["dp_sigma"],
-                "MendeleyTestAUC": dp_r.get("final_test_auc", "—"),
-                "MendeleyTestF1":  dp_r.get("final_test_f1", "—"),
-                "KAU_AUC":         "—", "KAU_F1": "—",
+                "MendeleyTestAUC": dp_r.get("final_test_auc", "N/A"),
+                "MendeleyTestF1":  dp_r.get("final_test_f1", "N/A"),
+                "KAU_AUC":         "N/A", "KAU_F1": "N/A",
                 "Notes":           f"DP noise σ={dp_r['dp_sigma']} on VQC gradients",
             })
 
@@ -740,9 +853,95 @@ def build_master_ablation(
         lambda r: round(float(r["MendeleyTestAUC"]) - float(r["KAU_AUC"]), 4)
         if str(r["MendeleyTestAUC"]).replace(".","").isdigit()
         and str(r["KAU_AUC"]).replace(".","").isdigit()
-        else "—", axis=1
+        else "N/A", axis=1
     )
     return df
+
+
+def generate_master_dashboard(master_df: pd.DataFrame,
+                              kau_results: dict,
+                              mendeley_results: dict,
+                              report: dict,
+                              save_path: Path):
+    """
+    Generate an aggregated Markdown summary dashboard capturing all key metrics
+    and findings across all experiment stages at a glance.
+    """
+    lines = []
+    lines.append("# QFL Breast Cancer Classification — Master Results Dashboard")
+    lines.append("")
+    lines.append(f"**Study**: {report.get('study', 'Privacy-Preserving Quantum Federated Learning for Breast Cancer Screening')}")
+    lines.append(f"**Primary Cohort (Train/Val/Test)**: {report.get('primary_dataset', 'Mendeley (Polokwane, South Africa)')}")
+    lines.append(f"**External Validation Cohort**: {report.get('external_dataset', 'KAU-BCMD (Saudi Arabia / MENA)')}")
+    lines.append("")
+    lines.append("---")
+    lines.append("## 1. Cross-Population Clinical Generalisation (At a Glance)")
+    lines.append("")
+    lines.append("| Model | Mendeley AUC | Mendeley PR-AUC | KAU AUC | KAU PR-AUC | KAU Brier | KAU F1 (0.5) | KAU Sens (0.5) | KAU Spec (0.5) | Opt τ* | KAU Sens (τ*) | KAU Spec (τ*) | KAU BalAcc (τ*) | Gap (AUC) |")
+    lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+
+    for name, k_res in kau_results.items():
+        m_res = mendeley_results.get(name, {})
+        m_auc = m_res.get("auc", "N/A")
+        m_ap  = m_res.get("average_precision", "N/A")
+        k_auc = k_res.get("auc", "N/A")
+        k_ap  = k_res.get("average_precision", "N/A")
+        k_br  = k_res.get("brier_score", "N/A")
+        k_f1  = k_res.get("f1", "N/A")
+        k_sens_05 = k_res.get("per_class", {}).get("Malignant", {}).get("recall", "N/A")
+        k_spec_05 = k_res.get("per_class", {}).get("Benign", {}).get("recall", "N/A")
+
+        tau_opt   = k_res.get("opt_threshold", "N/A")
+        k_sens_opt = k_res.get("per_class_at_opt", {}).get("Malignant", {}).get("recall", "N/A")
+        k_spec_opt = k_res.get("per_class_at_opt", {}).get("Benign", {}).get("recall", "N/A")
+        k_bacc_opt = k_res.get("balanced_acc_at_opt", "N/A")
+
+        gap = round(m_auc - k_auc, 4) if isinstance(m_auc, (int, float)) and isinstance(k_auc, (int, float)) else "N/A"
+
+        m_auc_str = f"{m_auc:.4f}" if isinstance(m_auc, (int, float)) else str(m_auc)
+        m_ap_str  = f"{m_ap:.4f}" if isinstance(m_ap, (int, float)) else str(m_ap)
+        k_auc_str = f"{k_auc:.4f}" if isinstance(k_auc, (int, float)) else str(k_auc)
+        k_ap_str  = f"{k_ap:.4f}" if isinstance(k_ap, (int, float)) else str(k_ap)
+        k_br_str  = f"{k_br:.4f}" if isinstance(k_br, (int, float)) else str(k_br)
+        k_f1_str  = f"{k_f1:.4f}" if isinstance(k_f1, (int, float)) else str(k_f1)
+        k_s05_str = f"{k_sens_05:.4f}" if isinstance(k_sens_05, (int, float)) else str(k_sens_05)
+        k_sp05_str= f"{k_spec_05:.4f}" if isinstance(k_spec_05, (int, float)) else str(k_spec_05)
+
+        tau_str   = f"{tau_opt:.4f}" if isinstance(tau_opt, (int, float)) else str(tau_opt)
+        k_sopt_str= f"{k_sens_opt:.4f}" if isinstance(k_sens_opt, (int, float)) else str(k_sens_opt)
+        k_spopt_str= f"{k_spec_opt:.4f}" if isinstance(k_spec_opt, (int, float)) else str(k_spec_opt)
+        k_bacc_str= f"{k_bacc_opt:.4f}" if isinstance(k_bacc_opt, (int, float)) else str(k_bacc_opt)
+        gap_str   = f"{gap:+.4f}" if isinstance(gap, (int, float)) else str(gap)
+
+        lines.append(f"| **{name}** | {m_auc_str} | {m_ap_str} | {k_auc_str} | {k_ap_str} | {k_br_str} | {k_f1_str} | {k_s05_str} | {k_sp05_str} | {tau_str} | {k_sopt_str} | {k_spopt_str} | {k_bacc_str} | {gap_str} |")
+
+    lines.append("")
+    lines.append("---")
+    lines.append("## 2. Master Ablation & Experiment Results")
+    lines.append("")
+    display_cols = [
+        "Model", "Category", "Qubits", "Layers", "TrainableParams",
+        "NoiseSigma", "DPSigma", "MendeleyTestAUC", "MendeleyTestF1",
+        "KAU_AUC", "KAU_F1", "GeneralisationGap"
+    ]
+    avail_cols = [c for c in display_cols if c in master_df.columns]
+    lines.append("| " + " | ".join(avail_cols) + " |")
+    lines.append("| " + " | ".join([":---:" if i > 1 else ":---" for i in range(len(avail_cols))]) + " |")
+    for _, row in master_df.iterrows():
+        vals = [str(row.get(c, "N/A")) for c in avail_cols]
+        lines.append("| " + " | ".join(vals) + " |")
+
+    lines.append("")
+    lines.append("---")
+    lines.append("## 3. Domain Shift Metrics (Mendeley SA vs KAU-BCMD MENA)")
+    shift = report.get("domain_shift", {})
+    if shift:
+        lines.append(f"- **Mean Jensen-Shannon Divergence**: `{shift.get('mean_js_divergence', 'N/A')}` (0 = identical, 1 = maximal shift)")
+        lines.append(f"- **Dimensions with Significant Shift (p < 0.05)**: `{shift.get('n_dims_significant_shift', 'N/A')}/{N_QUBITS}`")
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"  Master Summary Dashboard written to: {save_path}")
 
 
 def plot_master_ablation(df: pd.DataFrame, save_path: Path):
@@ -753,9 +952,9 @@ def plot_master_ablation(df: pd.DataFrame, save_path: Path):
         "MendeleyTestAUC", "MendeleyTestF1",
         "KAU_AUC", "KAU_F1", "GeneralisationGap"
     ]
-    plot_df = df[display_cols].fillna("—")
+    plot_df = df[display_cols].fillna("N/A")
 
-    fig, ax = plt.subplots(figsize=(22, max(4, len(plot_df) * 0.65 + 2)))
+    fig, ax = plt.subplots(figsize=(24, max(4.5, len(plot_df) * 0.7 + 2.5)))
     ax.axis("off")
     tbl = ax.table(
         cellText=plot_df.values,
@@ -763,11 +962,12 @@ def plot_master_ablation(df: pd.DataFrame, save_path: Path):
         cellLoc="center", loc="center",
     )
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(7.5)
-    tbl.scale(1, 1.55)
+    tbl.set_fontsize(8.5)
+    tbl.scale(1.15, 1.8)
 
     cat_colors = {
         "Classical":       "D5E8F0",
+        "Classical Control":"D5E8F0",
         "HQCNN Regime A":  "FFF2CC",
         "HQCNN Regime B":  "D5F5E3",
         "QFL Federated":   "E8D5F5",
@@ -786,10 +986,10 @@ def plot_master_ablation(df: pd.DataFrame, save_path: Path):
         "Master Ablation Table — All Experiments\n"
         "Privacy-Preserving QFL for Breast Cancer Screening in African & MENA Populations\n"
         "Primary: Mendeley (Polokwane, SA) | External: KAU-BCMD (Saudi Arabia)",
-        fontsize=11, fontweight="bold", pad=20
+        fontsize=12, fontweight="bold", pad=25
     )
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"  Saved: {save_path}")
 
@@ -811,12 +1011,19 @@ def main():
     print("\n[1/6] Loading KAU-BCMD features...")
     X_kau_raw, X_kau_pca, X_kau_scaled, y_kau = load_kau_features(N_QUBITS)
 
-    # Also load Mendeley test for comparison
-    X_test_pca = np.load(FEAT_DIR / f"features_test_pca{N_QUBITS}.npy")
-    y_test     = np.load(FEAT_DIR / "labels_test.npy")
+    # Load Mendeley splits for validation tuning and test evaluation
+    X_test_pca  = np.load(FEAT_DIR / f"features_test_pca{N_QUBITS}.npy")
+    y_test      = np.load(FEAT_DIR / "labels_test.npy")
+    X_val_pca   = np.load(FEAT_DIR / f"features_val_pca{N_QUBITS}.npy")
+    y_val       = np.load(FEAT_DIR / "labels_val.npy")
+    X_val_raw   = np.load(FEAT_DIR / "features_val_raw.npy")
     X_train_pca = np.load(FEAT_DIR / f"features_train_pca{N_QUBITS}.npy")
-    scaler_mm   = MinMaxScaler(feature_range=(0, 1)).fit(X_train_pca)
+    y_train_arr = np.load(FEAT_DIR / "labels_train.npy")
+
+    scaler_mm     = MinMaxScaler(feature_range=(0, 1)).fit(X_train_pca)
     X_test_scaled = scaler_mm.transform(X_test_pca)
+    X_val_scaled  = scaler_mm.transform(X_val_pca)
+    X_train_scaled= scaler_mm.transform(X_train_pca)
 
     # ── Load models ──────────────────────────────────────────────────────
     print("\n[2/6] Loading trained models...")
@@ -835,46 +1042,68 @@ def main():
         print(f"  [INFO] QFL checkpoint not found; skipping QFL KAU evaluation.")
         vqc_qfl = None
 
-    # ── Evaluate on KAU ──────────────────────────────────────────────────
-    print("\n[3/6] Evaluating on KAU-BCMD external validation set...")
+    # ── Evaluate on KAU with validation-tuned threshold ──────────────────
+    print("\n[3/6] Evaluating on KAU-BCMD external validation set (with validation-tuned threshold)...")
     kau_results = {}
     mendeley_results = {}
 
-    # Classical
+    # Classical MobileNetV2
     print("  Classical MobileNetV2...")
     X_kau_raw_t = np.load(FEAT_DIR / "features_kau_raw.npy")
     X_test_raw  = np.load(FEAT_DIR / "features_test_raw.npy")
-    kau_results["Classical"]      = evaluate_cnn_on_kau(cnn_model, X_kau_raw_t, y_kau)
-    mendeley_results["Classical"] = evaluate_cnn_on_kau(cnn_model, X_test_raw,  y_test)
+    cnn_val_eval = evaluate_cnn_on_kau(cnn_model, X_val_raw, y_val)
+    tau_cnn = cnn_val_eval["opt_threshold"]
+    print(f"    Validation optimal threshold τ*={tau_cnn:.4f}")
+    kau_results["Classical"]      = evaluate_cnn_on_kau(cnn_model, X_kau_raw_t, y_kau, opt_threshold=tau_cnn)
+    mendeley_results["Classical"] = evaluate_cnn_on_kau(cnn_model, X_test_raw,  y_test, opt_threshold=tau_cnn)
+
+    # Classical Micro-MLP (parameter-matched control on PCA features)
+    print("  Classical Micro-MLP Control...")
+    micromlp_model = load_or_train_micromlp(N_QUBITS, X_train_scaled, y_train_arr)
+    mlp_val_eval = evaluate_vqc_on_kau(micromlp_model, X_val_scaled, y_val)
+    tau_mlp = mlp_val_eval["opt_threshold"]
+    print(f"    Validation optimal threshold τ*={tau_mlp:.4f}")
+    kau_results["Micro-MLP"] = evaluate_vqc_on_kau(micromlp_model, X_kau_scaled, y_kau, opt_threshold=tau_mlp)
+    mendeley_results["Micro-MLP"] = evaluate_vqc_on_kau(micromlp_model, X_test_scaled, y_test, opt_threshold=tau_mlp)
+    kau_results["Micro-MLP"]["mendeley_auc"] = mendeley_results["Micro-MLP"]["auc"]
+    kau_results["Micro-MLP"]["mendeley_f1"] = mendeley_results["Micro-MLP"]["f1"]
 
     # HQCNN Regime A
     label_A = f"HQCNN q={N_QUBITS} l={N_LAYERS}"
     print(f"  {label_A}...")
-    kau_results[label_A]      = evaluate_vqc_on_kau(vqc_A, X_kau_scaled, y_kau)
+    vqc_val_eval = evaluate_vqc_on_kau(vqc_A, X_val_scaled, y_val)
+    tau_vqc = vqc_val_eval["opt_threshold"]
+    print(f"    Validation optimal threshold τ*={tau_vqc:.4f}")
+    kau_results[label_A]      = evaluate_vqc_on_kau(vqc_A, X_kau_scaled, y_kau, opt_threshold=tau_vqc)
     mendeley_results[label_A] = evaluate_vqc_on_kau(
-        vqc_A, X_test_scaled, y_test
+        vqc_A, X_test_scaled, y_test, opt_threshold=tau_vqc
     )
 
     # QFL model
     if vqc_qfl is not None:
         print("  QFL global model...")
-        kau_results["QFL"]      = evaluate_vqc_on_kau(vqc_qfl, X_kau_scaled, y_kau)
-        mendeley_results["QFL"] = evaluate_vqc_on_kau(vqc_qfl, X_test_scaled, y_test)
+        qfl_val_eval = evaluate_vqc_on_kau(vqc_qfl, X_val_scaled, y_val)
+        tau_qfl = qfl_val_eval["opt_threshold"]
+        print(f"    Validation optimal threshold τ*={tau_qfl:.4f}")
+        kau_results["QFL"]      = evaluate_vqc_on_kau(vqc_qfl, X_kau_scaled, y_kau, opt_threshold=tau_qfl)
+        mendeley_results["QFL"] = evaluate_vqc_on_kau(vqc_qfl, X_test_scaled, y_test, opt_threshold=tau_qfl)
 
     # Print summary
-    print("\n  ── Cross-population Results ──")
+    print("\n  ── Cross-population Clinical Results ──")
     for name in kau_results:
-        m_auc = mendeley_results.get(name, {}).get("auc", "—")
+        m_auc = mendeley_results.get(name, {}).get("auc", "N/A")
         k_auc = kau_results[name]["auc"]
-        gap   = round(m_auc - k_auc, 4) if isinstance(m_auc, float) else "—"
-        print(f"  {name:30s} | Mendeley AUC={m_auc:.4f} | "
-              f"KAU AUC={k_auc:.4f} | Gap={gap}")
-        # Per-class detail for KAU (important given 17:1 imbalance)
-        pc = kau_results[name]["per_class"]
-        print(f"    KAU Sensitivity (Malignant recall): "
-              f"{pc.get('Malignant',{}).get('recall','—'):.4f}")
-        print(f"    KAU Specificity (Benign recall):    "
-              f"{pc.get('Benign',{}).get('recall','—'):.4f}")
+        tau   = kau_results[name]["opt_threshold"]
+        k_f1  = kau_results[name]["f1"]
+        k_f1_opt = kau_results[name]["f1_at_opt"]
+        gap   = round(m_auc - k_auc, 4) if isinstance(m_auc, (int, float)) and isinstance(k_auc, (int, float)) else "N/A"
+        print(f"  {name:30s} | Mendeley AUC={m_auc} | "
+              f"KAU AUC={k_auc:.4f} | F1(0.5)={k_f1:.4f} | Opt τ*={tau:.4f} -> F1(τ*)={k_f1_opt:.4f} | Gap={gap}")
+        # Per-class detail for KAU
+        pc_05 = kau_results[name]["per_class"]
+        pc_opt = kau_results[name]["per_class_at_opt"]
+        print(f"    [0.5 default] Sens: {pc_05.get('Malignant',{}).get('recall','N/A')} | Spec: {pc_05.get('Benign',{}).get('recall','N/A')}")
+        print(f"    [Opt τ*={tau:.2f}] Sens: {pc_opt.get('Malignant',{}).get('recall','N/A')} | Spec: {pc_opt.get('Benign',{}).get('recall','N/A')} | BalAcc: {kau_results[name]['balanced_acc_at_opt']}")
 
     # ── Domain shift analysis ─────────────────────────────────────────────
     print("\n[4/6] Domain shift analysis...")
@@ -906,7 +1135,7 @@ def main():
         noise_dir=NOISE_DIR,
         qfl_dir=QFL_DIR,
     )
-    master_df.to_csv(OUT_DIR / "final_ablation_table.csv", index=False)
+    master_df.to_csv(OUT_DIR / "final_ablation_table.csv", index=False, encoding="utf-8-sig")
     plot_master_ablation(master_df, OUT_DIR / "final_ablation_table.png")
 
     # Parameter efficiency plot
@@ -936,30 +1165,33 @@ def main():
         plot_parameter_efficiency(results_for_plot,
                                    OUT_DIR / "parameter_efficiency.png")
 
-    # ── Save generalisation report ────────────────────────────────────────
+    # ── Save generalisation report & Master Dashboard ──────────────────────
     report = {
         "study": "Privacy-Preserving QFL for Breast Cancer Screening",
         "primary_dataset":  "Mendeley (Polokwane, South Africa)",
         "external_dataset": "KAU-BCMD (Saudi Arabia / MENA)",
         "cross_population_results": {
             name: {
-                "mendeley_auc": mendeley_results.get(name, {}).get("auc", "—"),
+                "mendeley_auc": mendeley_results.get(name, {}).get("auc", "N/A"),
                 "kau_auc":      kau_results[name]["auc"],
                 "kau_average_precision": kau_results[name]["average_precision"],
                 "kau_mcc":      kau_results[name]["mcc"],
                 "kau_f1":       kau_results[name]["f1"],
                 "kau_sensitivity": kau_results[name]["per_class"].get(
-                    "Malignant", {}).get("recall", "—"),
+                    "Malignant", {}).get("recall", "N/A"),
                 "kau_specificity": kau_results[name]["per_class"].get(
-                    "Benign", {}).get("recall", "—"),
+                    "Benign", {}).get("recall", "N/A"),
             }
             for name in kau_results
         },
         "domain_shift": shift_metrics,
         "ablation_table_path": str(OUT_DIR / "final_ablation_table.csv"),
     }
-    with open(OUT_DIR / "generalisation_report.json", "w") as f:
+    with open(OUT_DIR / "generalisation_report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
+
+    generate_master_dashboard(master_df, kau_results, mendeley_results, report, OUT_DIR / "master_summary_dashboard.md")
+    generate_master_dashboard(master_df, kau_results, mendeley_results, report, BASE / "master_summary_dashboard.md")
 
     CACHE.mark_done("external_validation")
 

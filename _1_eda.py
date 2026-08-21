@@ -543,8 +543,8 @@ def print_summary_table(df_m_audit: pd.DataFrame, df_k_audit: pd.DataFrame):
 def save_audit_csvs(df_m_audit: pd.DataFrame, df_k_audit: pd.DataFrame):
     mendeley_path = OUT_DIR / "mendeley_audit.csv"
     kau_path      = OUT_DIR / "kau_audit.csv"
-    df_m_audit.to_csv(mendeley_path, index=False)
-    df_k_audit.to_csv(kau_path,      index=False)
+    df_m_audit.to_csv(mendeley_path, index=False, encoding="utf-8-sig")
+    df_k_audit.to_csv(kau_path,      index=False, encoding="utf-8-sig")
     print(f"\n  Audit CSVs saved:")
     print(f"    {mendeley_path}")
     print(f"    {kau_path}")

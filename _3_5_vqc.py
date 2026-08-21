@@ -335,7 +335,7 @@ def train_vqc(n_qubits: int, n_layers: int, lr: float,
     ckpt_name = f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt"
     torch.save(best_state, out_subdir / ckpt_name)
     pd.DataFrame(history).to_csv(out_subdir / ckpt_name.replace(".pt", "_history.csv"),
-                                 index=False)
+                                 index=False, encoding="utf-8-sig")
 
     return {
         "n_qubits":      n_qubits,
@@ -443,6 +443,7 @@ def run_classical_control_configs(n_features: int = 4) -> list:
     test_aupr = average_precision_score(y_test, test_probs) if len(set(y_test)) > 1 else 0.0
     val_aupr = average_precision_score(y_val, val_probs) if len(set(y_val)) > 1 else 0.0
 
+    torch.save(model.state_dict(), OUT_DIR / "micromlp_q4.pt")
     results.append({
         "model": "Micro-MLP",
         "regime": "Classical control",
@@ -617,35 +618,35 @@ def build_ablation_table(all_results: list, baseline_json: Path) -> pd.DataFrame
         rows.append({
             "Model":           bl.get("backbone", bl.get("model", "Classical")),
             "Regime":          "Classical (head-only fine-tune)",
-            "Qubits":          "—",
-            "Layers":          "—",
+            "Qubits":          "N/A",
+            "Layers":          "N/A",
             "TrainableParams": bl.get("trainable_params", bl.get("head_params", "N/A")),
             "NoiseSigma":      0.0,
-            "ValAUC":          bl.get("best_val_auc", "—"),
-            "ValAUPRC":       bl.get("best_val_aupr", "—"),
-            "TestAUC":         bl.get("test_auc_roc", "—"),
-            "TestAUCPR":      bl.get("test_aupr", "—"),
-            "TestF1":          bl.get("test_f1",      "—"),
-            "TestAcc":         bl.get("test_accuracy","—"),
+            "ValAUC":          bl.get("best_val_auc", "N/A"),
+            "ValAUPRC":       bl.get("best_val_aupr", "N/A"),
+            "TestAUC":         bl.get("test_auc_roc", "N/A"),
+            "TestAUCPR":      bl.get("test_aupr", "N/A"),
+            "TestF1":          bl.get("test_f1",      "N/A"),
+            "TestAcc":         bl.get("test_accuracy","N/A"),
             "Notes":           "Classical baseline (frozen backbone)",
         })
 
     # ── VQC result rows ───────────────────────────────────────────────────────
     for r in all_results:
-        model_label = r.get("model") or f"HQCNN (VQC q={r.get('n_qubits', '—')} l={r.get('n_layers', '—')})"
+        model_label = r.get("model") or f"HQCNN (VQC q={r.get('n_qubits', 'N/A')} l={r.get('n_layers', 'N/A')})"
         rows.append({
             "Model":           model_label,
             "Regime":          r.get("regime", "A — frozen classical + VQC"),
-            "Qubits":          r.get("n_qubits", "—"),
-            "Layers":          r.get("n_layers", "—"),
-            "TrainableParams": r.get("trainable_params", r.get("vqc_params", "—")),
+            "Qubits":          r.get("n_qubits", "N/A"),
+            "Layers":          r.get("n_layers", "N/A"),
+            "TrainableParams": r.get("trainable_params", r.get("vqc_params", "N/A")),
             "NoiseSigma":      r.get("noise_sigma", 0.0),
-            "ValAUC":          r.get("best_val_auc", r.get("val_auc", "—")),
-            "ValAUPRC":       r.get("best_val_aupr", "—"),
-            "TestAUC":         r.get("test_auc_roc", r.get("test_auc", "—")),
-            "TestAUCPR":      r.get("test_aupr", "—"),
-            "TestF1":          r.get("test_f1",      "—"),
-            "TestAcc":         r.get("test_accuracy","—"),
+            "ValAUC":          r.get("best_val_auc", r.get("val_auc", "N/A")),
+            "ValAUPRC":       r.get("best_val_aupr", "N/A"),
+            "TestAUC":         r.get("test_auc_roc", r.get("test_auc", "N/A")),
+            "TestAUCPR":      r.get("test_aupr", "N/A"),
+            "TestF1":          r.get("test_f1",      "N/A"),
+            "TestAcc":         r.get("test_accuracy","N/A"),
             "Notes":           r.get("notes", ""),
         })
 
@@ -659,9 +660,9 @@ def plot_ablation_table(df: pd.DataFrame, save_path: Path):
                     "TrainableParams", "NoiseSigma",
                     "ValAUC", "ValAUPRC", "TestAUC", "TestAUCPR", "TestF1", "TestAcc"]
     plot_df = df[display_cols].copy()
-    plot_df = plot_df.fillna("—")
+    plot_df = plot_df.fillna("N/A")
 
-    fig, ax = plt.subplots(figsize=(18, max(4, len(plot_df) * 0.6 + 1.5)))
+    fig, ax = plt.subplots(figsize=(20, max(4.5, len(plot_df) * 0.65 + 2)))
     ax.axis("off")
     tbl = ax.table(
         cellText=plot_df.values,
@@ -670,8 +671,8 @@ def plot_ablation_table(df: pd.DataFrame, save_path: Path):
         loc="center",
     )
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(8)
-    tbl.scale(1, 1.6)
+    tbl.set_fontsize(8.5)
+    tbl.scale(1.1, 1.7)
 
     # Style header
     for j in range(len(display_cols)):
@@ -688,7 +689,7 @@ def plot_ablation_table(df: pd.DataFrame, save_path: Path):
                  "Mendeley Mammogram Dataset (Polokwane, South Africa)",
                  fontsize=12, fontweight="bold", pad=20)
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"  Ablation table saved: {save_path}")
 
@@ -844,7 +845,7 @@ def run_regime_B() -> list:
                 break
 
         pd.DataFrame(history).to_csv(
-            out / f"regimeB_q{n_qubits}_l{n_layers}_history.csv", index=False
+            out / f"regimeB_q{n_qubits}_l{n_layers}_history.csv", index=False, encoding="utf-8-sig"
         )
         # Save best checkpoint (needed by 6_7_uq.py)
         torch.save(best_state,
@@ -1074,11 +1075,15 @@ def run_noise_robustness(best_regime_A_result: dict) -> list:
             batch_size=TRAIN_CFG["batch_size"], shuffle=False
         )
         _, ts_acc, ts_f1, ts_auc, ts_aupr, _, _, _ = eval_epoch(model, test_dl_n, nn.BCELoss())
-        print(f"  σ={sigma:.2f}: AUC={ts_auc:.4f}  F1={ts_f1:.4f}  Acc={ts_acc:.4f}")
+        print(f"  σ={sigma:.2f}: AUC={ts_auc:.4f}  AUPR={ts_aupr:.4f}  F1={ts_f1:.4f}  Acc={ts_acc:.4f}")
         noise_results.append({
-            "noise_sigma": sigma, "test_auc_roc": round(ts_auc,4),
-            "test_f1": round(ts_f1,4), "test_accuracy": round(ts_acc,4),
-            "n_qubits": n_qubits, "n_layers": n_layers,
+            "noise_sigma": sigma,
+            "test_auc_roc": round(ts_auc, 4),
+            "test_aupr": round(ts_aupr, 4),
+            "test_f1": round(ts_f1, 4),
+            "test_accuracy": round(ts_acc, 4),
+            "n_qubits": n_qubits,
+            "n_layers": n_layers,
         })
 
     # Plot degradation curve
@@ -1097,7 +1102,7 @@ def run_noise_robustness(best_regime_A_result: dict) -> list:
     plt.close()
     print(f"  Noise robustness curve saved.")
 
-    df_noise.to_csv(out / "noise_results.csv", index=False)
+    df_noise.to_csv(out / "noise_results.csv", index=False, encoding="utf-8-sig")
     return noise_results
 
 
@@ -1163,7 +1168,7 @@ def main():
     print("  BUILDING ABLATION TABLE")
     print("═"*70)
     ablation_df = build_ablation_table(all_results, BASELINE_JSON)
-    ablation_df.to_csv(OUT_DIR / "ablation_table.csv", index=False)
+    ablation_df.to_csv(OUT_DIR / "ablation_table.csv", index=False, encoding="utf-8-sig")
     plot_ablation_table(ablation_df, OUT_DIR / "ablation_table.png")
 
     print("\n━"*70)

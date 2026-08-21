@@ -45,7 +45,7 @@ from torchvision.models import (
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
-    accuracy_score, f1_score, roc_auc_score,
+    accuracy_score, f1_score, roc_auc_score, average_precision_score,
     confusion_matrix, classification_report, roc_curve
 )
 
@@ -342,11 +342,14 @@ def evaluate(model, loader, criterion, device):
     unique_probs = set(np.round(all_probs, 6))  # Round to avoid floating point noise
     if len(unique_labels) < 2:
         auc = 0.0  # No variance in labels
+        aupr = 0.0
     elif len(unique_probs) < 2:
         auc = 0.5  # No variance in predictions (random)
+        aupr = float(np.mean(all_labels))
     else:
         auc = roc_auc_score(all_labels, all_probs)
-    return avg_loss, acc, f1, auc, all_labels, all_preds, all_probs
+        aupr = average_precision_score(all_labels, all_probs)
+    return avg_loss, acc, f1, auc, aupr, all_labels, all_preds, all_probs
 
 
 def get_optimizer(model, cfg, backbone_name: str, strategy: str):
@@ -568,12 +571,13 @@ def main():
             )
 
         tr_loss, tr_acc, tr_f1 = train_one_epoch(model, train_loader, criterion, optimizer, DEVICE)
-        vl_loss, vl_acc, vl_f1, vl_auc, _, _, _ = evaluate(model, val_loader, criterion, DEVICE)
+        vl_loss, vl_acc, vl_f1, vl_auc, vl_aupr, _, _, _ = evaluate(model, val_loader, criterion, DEVICE)
         scheduler.step()
 
         is_best = vl_auc > best_val_auc
         if is_best:
             best_val_auc = vl_auc
+            best_val_aupr = vl_aupr
             best_epoch = epoch
             torch.save(model.state_dict(), CKPT_BEST)
             patience_ctr = 0
@@ -584,13 +588,13 @@ def main():
             "epoch":     epoch,
             "train_loss": tr_loss, "train_acc": tr_acc, "train_f1": tr_f1,
             "val_loss":   vl_loss, "val_acc":   vl_acc, "val_f1":   vl_f1,
-            "val_auc":    vl_auc,  "is_best":   is_best,
+            "val_auc":    vl_auc,  "val_aupr":  vl_aupr, "is_best":   is_best,
             "lr": optimizer.param_groups[0]["lr"],
         })
 
         print(f"  Epoch {epoch:3d}/{CFG['num_epochs']} | "
               f"TrLoss: {tr_loss:.4f} TrAcc: {tr_acc:.4f} | "
-              f"VlLoss: {vl_loss:.4f} VlAcc: {vl_acc:.4f} VlAUC: {vl_auc:.4f}"
+              f"VlLoss: {vl_loss:.4f} VlAcc: {vl_acc:.4f} VlAUC: {vl_auc:.4f} VlAUPR: {vl_aupr:.4f}"
               + (" ← BEST" if is_best else ""))
 
         if patience_ctr >= CFG["patience"]:
@@ -599,13 +603,13 @@ def main():
 
     torch.save(model.state_dict(), CKPT_FINAL)
     hist_df = pd.DataFrame(history)
-    hist_df.to_csv(OUT_DIR / "training_history.csv", index=False)
+    hist_df.to_csv(OUT_DIR / "training_history.csv", index=False, encoding="utf-8-sig")
     plot_training_curves(hist_df)
 
     # ── Test evaluation ──────────────────────────────────────────────────────
     print("\n[6/6] Evaluating on test set (best checkpoint)...")
     model.load_state_dict(torch.load(CKPT_BEST, map_location=DEVICE))
-    ts_loss, ts_acc, ts_f1, ts_auc, y_true, y_pred, y_probs = evaluate(
+    ts_loss, ts_acc, ts_f1, ts_auc, ts_aupr, y_true, y_pred, y_probs = evaluate(
         model, test_loader, criterion, DEVICE
     )
 
@@ -613,6 +617,7 @@ def main():
     print(f"  Accuracy : {ts_acc:.4f}")
     print(f"  F1-score : {ts_f1:.4f}")
     print(f"  AUC-ROC  : {ts_auc:.4f}")
+    print(f"  PR-AUC   : {ts_aupr:.4f}")
     # Count unique classes in test set
     unique_classes = set(y_true)
     print(f"\n  Test set unique classes: {sorted(unique_classes)}")
@@ -642,12 +647,14 @@ def main():
         "test_accuracy":   round(ts_acc,  4),
         "test_f1":         round(ts_f1,   4),
         "test_auc_roc":    round(ts_auc,  4),
+        "test_aupr":       round(ts_aupr, 4),
         "best_val_auc":    round(best_val_auc, 4),
+        "best_val_aupr":   round(best_val_aupr, 4) if 'best_val_aupr' in locals() else round(ts_aupr, 4),
         "total_params":    n_total_params,
         "trainable_params": n_trainable,
         "config":          CFG,
     }
-    with open(OUT_DIR / "baseline_results.json", "w") as f:
+    with open(OUT_DIR / "baseline_results.json", "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
 
     print(f"\n✓ BASELINE TRAINING COMPLETE.")

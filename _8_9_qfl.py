@@ -79,7 +79,7 @@ from flwr.server.strategy import FedAvg
 from flwr.server.client_proxy import ClientProxy
 
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
+from sklearn.metrics import roc_auc_score, f1_score, accuracy_score, average_precision_score
 
 from pipeline_utils import seed_everything
 
@@ -150,6 +150,7 @@ FL_CFG = {
     "local_epochs":   3,        # local epochs per client per round
     "local_lr":       0.005,    # local VQC learning rate
     "batch_size":     16,
+    "clip_norm":      1.0,      # L2 gradient clipping threshold C for differential privacy
     "random_state":   42,
 }
 
@@ -313,9 +314,11 @@ class MicroMLPClient(fl.client.Client):
                 loss = criterion(self.model(X_b), y_b)
                 loss.backward()
                 if self.dp_sigma > 0:
+                    clip_norm = FL_CFG.get("clip_norm", 1.0)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=clip_norm)
                     for param in self.model.parameters():
                         if param.grad is not None:
-                            param.grad += torch.randn_like(param.grad) * self.dp_sigma
+                            param.grad += torch.randn_like(param.grad) * (self.dp_sigma * clip_norm)
                 optimizer.step()
 
         updated_params = self.model.get_parameters()
@@ -395,6 +398,7 @@ def run_classical_fedavg_baseline(partitions: dict,
     return {
         "val_auc": round(roc_auc_score(y_val,  val_p), 4),
         "test_auc": round(roc_auc_score(y_test, test_p), 4),
+        "test_aupr": round(average_precision_score(y_test, test_p) if len(set(y_test)) > 1 else 0.0, 4),
         "test_f1": round(f1_score(y_test, (test_p > 0.5).astype(int), zero_division=0), 4),
         "test_accuracy": round(accuracy_score(y_test, (test_p > 0.5).astype(int)), 4),
         "params": global_model.count_params(),
@@ -584,11 +588,13 @@ class QFLClient(fl.client.Client):
                 optimizer.zero_grad()
                 loss = criterion(self.model(X_b), y_b)
                 loss.backward()
-                # ── Differential privacy: add Gaussian noise to gradients ──
+                # ── Differential privacy: add Gaussian noise to clipped gradients ──
                 if self.dp_sigma > 0:
+                    clip_norm = FL_CFG.get("clip_norm", 1.0)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=clip_norm)
                     for param in self.model.parameters():
                         if param.grad is not None:
-                            param.grad += torch.randn_like(param.grad) * self.dp_sigma
+                            param.grad += torch.randn_like(param.grad) * (self.dp_sigma * clip_norm)
                 optimizer.step()
 
         # Return updated parameters (never raw data)
@@ -711,15 +717,19 @@ def run_federated_simulation(partitions: dict,
 
         val_auc  = roc_auc_score(y_val,  val_probs)  if len(set(y_val))  > 1 else 0.0
         test_auc = roc_auc_score(y_test, test_probs) if len(set(y_test)) > 1 else 0.0
+        val_aupr = average_precision_score(y_val,  val_probs)  if len(set(y_val))  > 1 else 0.0
+        test_aupr = average_precision_score(y_test, test_probs) if len(set(y_test)) > 1 else 0.0
         val_f1   = f1_score(y_val,  (val_probs  > 0.5).astype(int), zero_division=0)
         test_f1  = f1_score(y_test, (test_probs > 0.5).astype(int), zero_division=0)
 
         row = {
             "round":      round_num,
-            "val_auc":    round(val_auc,  4),
-            "test_auc":   round(test_auc, 4),
-            "val_f1":     round(val_f1,   4),
-            "test_f1":    round(test_f1,  4),
+            "val_auc":    round(val_auc,   4),
+            "val_aupr":   round(val_aupr,  4),
+            "test_auc":   round(test_auc,  4),
+            "test_aupr":  round(test_aupr, 4),
+            "val_f1":     round(val_f1,    4),
+            "test_f1":    round(test_f1,   4),
             "dp_sigma":   dp_sigma,
         }
 
@@ -737,16 +747,18 @@ def run_federated_simulation(partitions: dict,
 
         if round_num % 5 == 0 or round_num == 1:
             print(f"  Round {round_num:3d}/{n_rounds} | "
-                  f"Val AUC={val_auc:.4f} | Test AUC={test_auc:.4f} | "
+                  f"Val AUC={val_auc:.4f} | Test AUC={test_auc:.4f} | Test AUPR={test_aupr:.4f} | "
                   f"F1={test_f1:.4f} | σ_dp={dp_sigma}")
 
     final_metrics = {
-        "final_val_auc":  history[-1]["val_auc"],
-        "final_test_auc": history[-1]["test_auc"],
-        "final_test_f1":  history[-1]["test_f1"],
-        "dp_sigma":       dp_sigma,
-        "n_rounds":       n_rounds,
-        "vqc_params":     global_model.count_params(),
+        "final_val_auc":   history[-1]["val_auc"],
+        "final_val_aupr":  history[-1]["val_aupr"],
+        "final_test_auc":  history[-1]["test_auc"],
+        "final_test_aupr": history[-1]["test_aupr"],
+        "final_test_f1":   history[-1]["test_f1"],
+        "dp_sigma":        dp_sigma,
+        "n_rounds":        n_rounds,
+        "vqc_params":      global_model.count_params(),
     }
     return pd.DataFrame(history), global_model, final_metrics
 
@@ -794,6 +806,7 @@ def run_centralised_baseline(X_train, y_train, X_val, y_val,
     return {
         "val_auc":   round(roc_auc_score(y_val,  val_p),  4),
         "test_auc":  round(roc_auc_score(y_test, test_p), 4),
+        "test_aupr": round(average_precision_score(y_test, test_p) if len(set(y_test)) > 1 else 0.0, 4),
         "test_f1":   round(f1_score(y_test, (test_p > 0.5).astype(int),
                                     zero_division=0), 4),
         "vqc_params": model.count_params(),
@@ -1064,7 +1077,7 @@ def main():
         dp_sigma=0.0,
         warm_start_params=warm_params,
     )
-    fed_history.to_csv(OUT_DIR / "federated_training.csv", index=False)
+    fed_history.to_csv(OUT_DIR / "federated_training.csv", index=False, encoding="utf-8-sig")
 
     # Save final global model
     torch.save(global_model.state_dict(),
