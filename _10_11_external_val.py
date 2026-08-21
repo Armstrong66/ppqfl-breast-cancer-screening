@@ -27,6 +27,7 @@ Outputs (../ppqfl-breast-cancer-screening/outputs/external_val_outputs/):
 =============================================================================
 """
 
+from copy import deepcopy
 import json, pickle, re, warnings
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
@@ -147,15 +148,65 @@ class VQCModel(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-def load_vqc(ckpt_dir, n_qubits, n_layers, lr):
+def load_or_train_vqc(n_qubits: int, n_layers: int, lr: float = 0.01,
+                      X_train_scaled: Optional[np.ndarray] = None,
+                      y_train: Optional[np.ndarray] = None,
+                      X_val_scaled: Optional[np.ndarray] = None,
+                      y_val: Optional[np.ndarray] = None) -> VQCModel:
+    """Load existing VQC checkpoint across all directories, or fit quickly with validation early-stopping."""
     seed_everything(42)
     model = VQCModel(n_qubits, n_layers)
-    ckpt  = ckpt_dir / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt"
-    if ckpt.exists():
-        model.load_state_dict(torch.load(ckpt, map_location="cpu"))
-        print(f"  Loaded: {ckpt}")
-    else:
-        print(f"  [WARN] checkpoint not found: {ckpt}")
+
+    candidates = [
+        VQC_DIR_A / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt",
+        VQC_DIR_A.parent / "sweep" / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt",
+    ]
+    for p in [VQC_DIR_A, VQC_DIR_A.parent / "sweep", BASE / "vqc_outputs"]:
+        if p.exists():
+            candidates.extend(list(p.glob(f"vqc_q{n_qubits}_l{n_layers}_*.pt")))
+
+    for ckpt in candidates:
+        if ckpt.exists():
+            try:
+                model.load_state_dict(torch.load(ckpt, map_location="cpu"))
+                print(f"  Loaded VQC checkpoint: {ckpt.name}")
+                model.eval()
+                return model
+            except Exception:
+                continue
+
+    if X_train_scaled is not None and y_train is not None and X_val_scaled is not None and y_val is not None:
+        print(f"  [INFO] Training VQC q={n_qubits} l={n_layers} lr={lr} (no prior checkpoint found)...")
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        criterion = nn.BCELoss()
+        ds = TensorDataset(torch.tensor(X_train_scaled, dtype=torch.float32),
+                           torch.tensor(y_train, dtype=torch.float32))
+        loader = DataLoader(ds, batch_size=16, shuffle=True)
+
+        best_auc, patience_ctr, best_state = 0.0, 0, None
+        for epoch in range(1, 25):
+            model.train()
+            for X_b, y_b in loader:
+                optimizer.zero_grad()
+                loss = criterion(model(X_b), y_b)
+                loss.backward()
+                optimizer.step()
+
+            model.eval()
+            with torch.no_grad():
+                v_probs = model(torch.tensor(X_val_scaled, dtype=torch.float32)).numpy()
+            v_auc = roc_auc_score(y_val, v_probs) if len(set(y_val)) > 1 else 0.0
+            if v_auc > best_auc:
+                best_auc = v_auc
+                best_state = deepcopy(model.state_dict())
+                patience_ctr = 0
+            else:
+                patience_ctr += 1
+            if patience_ctr >= 5:
+                break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
     model.eval()
     return model
 
@@ -616,18 +667,18 @@ def build_master_ablation(
     if "Micro-MLP" in kau_results_dict:
         m_res = kau_results_dict["Micro-MLP"]
         rows.append({
-            "Model":            "Micro-MLP (Classical)",
+            "Model":            f"Micro-MLP (dim={N_QUBITS})",
             "ModelShort":       "Micro-MLP",
             "Category":         "Classical Control",
             "Regime":           "Classical micro-model on PCA features",
-            "Qubits":           N_QUBITS, "Layers": 0,
-            "TrainableParams":  N_QUBITS + 1,
+            "Qubits":           "N/A", "Layers": "N/A",
+            "TrainableParams":  N_QUBITS * 2 + 2 + 2 * 1 + 1,  # ClassicalMicroMLP(N_QUBITS)
             "NoiseSigma":       0.0, "DPSigma": 0.0,
             "MendeleyTestAUC":  m_res.get("mendeley_auc", "N/A"),
             "MendeleyTestF1":   m_res.get("mendeley_f1", "N/A"),
             "KAU_AUC":          m_res.get("auc", "N/A"),
             "KAU_F1":           m_res.get("f1", "N/A"),
-            "Notes":            "Classical linear probe / micro-model (parameter-matched control)",
+            "Notes":            f"Classical MLP on top {N_QUBITS} PCA components",
         })
 
     # ── 2. VQC Regime A primary results (best config per qubit count) ────────
@@ -666,13 +717,16 @@ def build_master_ablation(
         ctrl_rows = df_abl[df_abl["Regime"].str.contains("control|param-matched", case=False, na=False)]
         for _, r in ctrl_rows.iterrows():
             m_name = str(r.get("Model", "Classical Control"))
+            # Avoid duplicate Micro-MLP rows
+            if "micro-mlp" in m_name.lower():
+                continue
             rows.append({
                 "Model":           m_name,
                 "ModelShort":      m_name[:15],
                 "Category":        "Classical Control",
                 "Regime":          str(r.get("Regime", "Classical control")),
-                "Qubits":          r.get("Qubits", "N/A"),
-                "Layers":          r.get("Layers", "N/A"),
+                "Qubits":          "N/A",
+                "Layers":          "N/A",
                 "TrainableParams": r.get("TrainableParams", "N/A"),
                 "NoiseSigma":      r.get("NoiseSigma", 0.0),
                 "DPSigma":         0.0,
@@ -846,6 +900,48 @@ def build_master_ablation(
                 "MendeleyTestF1":  dp_r.get("final_test_f1", "N/A"),
                 "KAU_AUC":         "N/A", "KAU_F1": "N/A",
                 "Notes":           f"DP noise σ={dp_r['dp_sigma']} on VQC gradients",
+            })
+
+    # ── 5. Add any remaining capacity spectrum models evaluated in kau_results_dict ──
+    existing_model_names = {r["Model"] for r in rows}
+    for label, k_res in kau_results_dict.items():
+        if label not in existing_model_names and not any(r["Model"] == label for r in rows):
+            m_auc = k_res.get("mendeley_auc", "N/A")
+            m_f1  = k_res.get("mendeley_f1", "N/A")
+            k_auc = k_res.get("auc", "N/A")
+            k_f1  = k_res.get("f1", "N/A")
+            nq_match = re.search(r"q=(\d+)", label)
+            nl_match = re.search(r"l=(\d+)", label)
+            dim_match = re.search(r"dim=(\d+)", label)
+            
+            if nq_match and nl_match:
+                nq = int(nq_match.group(1)); nl = int(nl_match.group(1))
+                params = nq * nl + 1
+                cat = "HQCNN Regime A"
+            elif dim_match:
+                dim = int(dim_match.group(1))
+                nq = "N/A"; nl = "N/A"
+                params = dim * 2 + 2 + 2 * 1 + 1
+                cat = "Classical Control"
+            else:
+                nq = "N/A"; nl = "N/A"; params = "N/A"
+                cat = "Classical" if "Classical" in label else "QFL Federated"
+
+            rows.append({
+                "Model":           label,
+                "ModelShort":      label[:15],
+                "Category":        cat,
+                "Regime":          "Capacity spectrum evaluation",
+                "Qubits":          nq,
+                "Layers":          nl,
+                "TrainableParams": params,
+                "NoiseSigma":      0.0,
+                "DPSigma":         0.0,
+                "MendeleyTestAUC": m_auc,
+                "MendeleyTestF1":  m_f1,
+                "KAU_AUC":         k_auc,
+                "KAU_F1":          k_f1,
+                "Notes":           f"Evaluated capacity tier ({params} params)",
             })
 
     # ── Compute generalisation gap ────────────────────────────────────────
@@ -1044,53 +1140,91 @@ def main():
         vqc_qfl = None
 
     # ── Evaluate on KAU with validation-tuned threshold ──────────────────
-    print("\n[3/6] Evaluating on KAU-BCMD external validation set (with validation-tuned threshold)...")
+    print("\n[3/6] Evaluating model spectrum on KAU-BCMD external validation set (with validation-tuned threshold)...")
     kau_results = {}
     mendeley_results = {}
 
-    # Classical MobileNetV2
-    print("  Classical MobileNetV2...")
+    # 1. Classical MobileNetV2
+    print("  [1] Classical MobileNetV2 (164,226 params)...")
     X_kau_raw_t = np.load(FEAT_DIR / "features_kau_raw.npy")
     X_test_raw  = np.load(FEAT_DIR / "features_test_raw.npy")
     cnn_val_eval = evaluate_cnn_on_kau(cnn_model, X_val_raw, y_val)
     tau_cnn = cnn_val_eval["opt_threshold"]
-    print(f"    Validation optimal threshold τ*={tau_cnn:.4f}")
-    kau_results["Classical"]      = evaluate_cnn_on_kau(cnn_model, X_kau_raw_t, y_kau, opt_threshold=tau_cnn)
-    mendeley_results["Classical"] = evaluate_cnn_on_kau(cnn_model, X_test_raw,  y_test, opt_threshold=tau_cnn)
+    print(f"      Validation optimal threshold τ*={tau_cnn:.4f}")
+    kau_results["Classical (MobileNetV2)"]      = evaluate_cnn_on_kau(cnn_model, X_kau_raw_t, y_kau, opt_threshold=tau_cnn)
+    mendeley_results["Classical (MobileNetV2)"] = evaluate_cnn_on_kau(cnn_model, X_test_raw,  y_test, opt_threshold=tau_cnn)
+    kau_results["Classical (MobileNetV2)"]["mendeley_auc"] = mendeley_results["Classical (MobileNetV2)"]["auc"]
+    kau_results["Classical (MobileNetV2)"]["mendeley_f1"] = mendeley_results["Classical (MobileNetV2)"]["f1"]
 
-    # Classical Micro-MLP (parameter-matched control on PCA features)
-    print("  Classical Micro-MLP Control...")
-    micromlp_model = load_or_train_micromlp(N_QUBITS, X_train_scaled, y_train_arr)
-    mlp_val_eval = evaluate_vqc_on_kau(micromlp_model, X_val_scaled, y_val)
-    tau_mlp = mlp_val_eval["opt_threshold"]
-    print(f"    Validation optimal threshold τ*={tau_mlp:.4f}")
-    kau_results["Micro-MLP"] = evaluate_vqc_on_kau(micromlp_model, X_kau_scaled, y_kau, opt_threshold=tau_mlp)
-    mendeley_results["Micro-MLP"] = evaluate_vqc_on_kau(micromlp_model, X_test_scaled, y_test, opt_threshold=tau_mlp)
-    kau_results["Micro-MLP"]["mendeley_auc"] = mendeley_results["Micro-MLP"]["auc"]
-    kau_results["Micro-MLP"]["mendeley_f1"] = mendeley_results["Micro-MLP"]["f1"]
+    # 2. Classical Micro-MLP Controls (dim=4 and dim=6)
+    for dim in [4, N_QUBITS]:
+        f_tr_pca = FEAT_DIR / f"features_train_pca{dim}.npy"
+        f_va_pca = FEAT_DIR / f"features_val_pca{dim}.npy"
+        f_te_pca = FEAT_DIR / f"features_test_pca{dim}.npy"
+        f_ka_pca = FEAT_DIR / f"features_kau_pca{dim}.npy"
+        if f_tr_pca.exists() and f_ka_pca.exists():
+            lbl = f"Micro-MLP (dim={dim})"
+            if lbl in kau_results:
+                continue
+            print(f"  [2] Classical {lbl} Control...")
+            X_tr_p = np.load(f_tr_pca); X_va_p = np.load(f_va_pca)
+            X_te_p = np.load(f_te_pca); X_ka_p = np.load(f_ka_pca)
+            sc = MinMaxScaler(feature_range=(0, 1)).fit(X_tr_p)
+            X_tr_s, X_va_s, X_te_s, X_ka_s = sc.transform(X_tr_p), sc.transform(X_va_p), sc.transform(X_te_p), sc.transform(X_ka_p)
+            
+            mlp_m = load_or_train_micromlp(dim, X_tr_s, y_train_arr)
+            mlp_v = evaluate_vqc_on_kau(mlp_m, X_va_s, y_val)
+            tau_mlp = mlp_v["opt_threshold"]
+            print(f"      Validation optimal threshold τ*={tau_mlp:.4f}")
+            kau_results[lbl] = evaluate_vqc_on_kau(mlp_m, X_ka_s, y_kau, opt_threshold=tau_mlp)
+            mendeley_results[lbl] = evaluate_vqc_on_kau(mlp_m, X_te_s, y_test, opt_threshold=tau_mlp)
+            kau_results[lbl]["mendeley_auc"] = mendeley_results[lbl]["auc"]
+            kau_results[lbl]["mendeley_f1"] = mendeley_results[lbl]["f1"]
 
-    # HQCNN Regime A
-    label_A = f"HQCNN q={N_QUBITS} l={N_LAYERS}"
-    print(f"  {label_A}...")
-    vqc_val_eval = evaluate_vqc_on_kau(vqc_A, X_val_scaled, y_val)
-    tau_vqc = vqc_val_eval["opt_threshold"]
-    print(f"    Validation optimal threshold τ*={tau_vqc:.4f}")
-    kau_results[label_A]      = evaluate_vqc_on_kau(vqc_A, X_kau_scaled, y_kau, opt_threshold=tau_vqc)
-    mendeley_results[label_A] = evaluate_vqc_on_kau(
-        vqc_A, X_test_scaled, y_test, opt_threshold=tau_vqc
-    )
+    # 3. Curated Spectrum of VQC Models (Low Floor to Upper Bound)
+    vqc_spectrum = [
+        (4, 1, 0.01, "HQCNN q=4 l=1 (Minimal Floor, 5p)"),
+        (4, 2, 0.01, "HQCNN q=4 l=2 (Standard 4Q, 9p)"),
+        (4, 3, 0.01, "HQCNN q=4 l=3 (Deep 4Q, 13p)"),
+        (6, 2, 0.01, "HQCNN q=6 l=2 (Primary Sweep Best, 13p)"),
+        (8, 1, 0.01, "HQCNN q=8 l=1 (Wide Floor, 9p)"),
+        (8, 2, 0.01, "HQCNN q=8 l=2 (Wide Standard, 17p)"),
+    ]
 
-    # QFL model
+    for nq, nl, lr, lbl in vqc_spectrum:
+        f_tr_pca = FEAT_DIR / f"features_train_pca{nq}.npy"
+        f_va_pca = FEAT_DIR / f"features_val_pca{nq}.npy"
+        f_te_pca = FEAT_DIR / f"features_test_pca{nq}.npy"
+        f_ka_pca = FEAT_DIR / f"features_kau_pca{nq}.npy"
+        if f_tr_pca.exists() and f_ka_pca.exists():
+            print(f"  [3] {lbl}...")
+            X_tr_p = np.load(f_tr_pca); X_va_p = np.load(f_va_pca)
+            X_te_p = np.load(f_te_pca); X_ka_p = np.load(f_ka_pca)
+            sc = MinMaxScaler(feature_range=(0, 1)).fit(X_tr_p)
+            X_tr_s, X_va_s, X_te_s, X_ka_s = sc.transform(X_tr_p), sc.transform(X_va_p), sc.transform(X_te_p), sc.transform(X_ka_p)
+
+            vqc_m = load_or_train_vqc(nq, nl, lr, X_tr_s, y_train_arr, X_va_s, y_val)
+            vqc_v = evaluate_vqc_on_kau(vqc_m, X_va_s, y_val)
+            tau_v = vqc_v["opt_threshold"]
+            print(f"      Validation optimal threshold τ*={tau_v:.4f}")
+            kau_results[lbl] = evaluate_vqc_on_kau(vqc_m, X_ka_s, y_kau, opt_threshold=tau_v)
+            mendeley_results[lbl] = evaluate_vqc_on_kau(vqc_m, X_te_s, y_test, opt_threshold=tau_v)
+            kau_results[lbl]["mendeley_auc"] = mendeley_results[lbl]["auc"]
+            kau_results[lbl]["mendeley_f1"] = mendeley_results[lbl]["f1"]
+
+    # 4. QFL Global Model
     if vqc_qfl is not None:
-        print("  QFL global model...")
+        print(f"  [4] QFL Global Model (Federated q={N_QUBITS} l={N_LAYERS}, 13p)...")
         qfl_val_eval = evaluate_vqc_on_kau(vqc_qfl, X_val_scaled, y_val)
         tau_qfl = qfl_val_eval["opt_threshold"]
-        print(f"    Validation optimal threshold τ*={tau_qfl:.4f}")
-        kau_results["QFL"]      = evaluate_vqc_on_kau(vqc_qfl, X_kau_scaled, y_kau, opt_threshold=tau_qfl)
-        mendeley_results["QFL"] = evaluate_vqc_on_kau(vqc_qfl, X_test_scaled, y_test, opt_threshold=tau_qfl)
+        print(f"      Validation optimal threshold τ*={tau_qfl:.4f}")
+        kau_results["QFL (Federated)"]      = evaluate_vqc_on_kau(vqc_qfl, X_kau_scaled, y_kau, opt_threshold=tau_qfl)
+        mendeley_results["QFL (Federated)"] = evaluate_vqc_on_kau(vqc_qfl, X_test_scaled, y_test, opt_threshold=tau_qfl)
+        kau_results["QFL (Federated)"]["mendeley_auc"] = mendeley_results["QFL (Federated)"]["auc"]
+        kau_results["QFL (Federated)"]["mendeley_f1"] = mendeley_results["QFL (Federated)"]["f1"]
 
     # Print summary
-    print("\n  ── Cross-population Clinical Results ──")
+    print("\n  ── Cross-population Clinical Results (Capacity Spectrum) ──")
     for name in kau_results:
         m_auc = mendeley_results.get(name, {}).get("auc", "N/A")
         k_auc = kau_results[name]["auc"]
@@ -1098,7 +1232,7 @@ def main():
         k_f1  = kau_results[name]["f1"]
         k_f1_opt = kau_results[name]["f1_at_opt"]
         gap   = round(m_auc - k_auc, 4) if isinstance(m_auc, (int, float)) and isinstance(k_auc, (int, float)) else "N/A"
-        print(f"  {name:30s} | Mendeley AUC={m_auc} | "
+        print(f"  {name:42s} | Mendeley AUC={m_auc} | "
               f"KAU AUC={k_auc:.4f} | F1(0.5)={k_f1:.4f} | Opt τ*={tau:.4f} -> F1(τ*)={k_f1_opt:.4f} | Gap={gap}")
         # Per-class detail for KAU
         pc_05 = kau_results[name]["per_class"]

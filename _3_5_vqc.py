@@ -631,14 +631,16 @@ def build_ablation_table(all_results: list, baseline_json: Path) -> pd.DataFrame
             "Notes":           "Classical baseline (frozen backbone)",
         })
 
-    # ── VQC result rows ───────────────────────────────────────────────────────
+    # ── VQC & control result rows ──────────────────────────────────────────────
     for r in all_results:
         model_label = r.get("model") or f"HQCNN (VQC q={r.get('n_qubits', 'N/A')} l={r.get('n_layers', 'N/A')})"
+        regime = str(r.get("regime", "A — frozen classical + VQC"))
+        is_classical = "control" in regime.lower() or "classical" in model_label.lower() or "logistic" in model_label.lower()
         rows.append({
             "Model":           model_label,
-            "Regime":          r.get("regime", "A — frozen classical + VQC"),
-            "Qubits":          r.get("n_qubits", "N/A"),
-            "Layers":          r.get("n_layers", "N/A"),
+            "Regime":          regime,
+            "Qubits":          "N/A" if is_classical else r.get("n_qubits", "N/A"),
+            "Layers":          "N/A" if is_classical else r.get("n_layers", "N/A"),
             "TrainableParams": r.get("trainable_params", r.get("vqc_params", "N/A")),
             "NoiseSigma":      r.get("noise_sigma", 0.0),
             "ValAUC":          r.get("best_val_auc", r.get("val_auc", "N/A")),
