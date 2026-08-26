@@ -60,6 +60,8 @@ Thumbs.db
 .env
 secrets.yaml
 *_private*
+PPQFL_journal_rigor_plan_v2.md
+fix_these_asap.md
 
 # ── Miscellaneous ─────────────────────────────────────────────
 run_commands.txt

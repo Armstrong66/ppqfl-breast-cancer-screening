@@ -71,7 +71,7 @@ _SENTINELS = {
         _OUT / "feature_outputs" / "pca_report.json",
     ],
     "vqc": [
-        _OUT / "vqc_outputs" / "regime_A" / f"vqc_q4_l2_lr0.01.pt",
+        _OUT / "vqc_outputs" / "regime_A" / "best_run_manifest.json",
         _OUT / "vqc_outputs" / "ablation_table.csv",
     ],
     "uq": [

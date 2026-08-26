@@ -99,7 +99,23 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def auto_detect_best_vqc_config(ckpt_dir: Path) -> Tuple[int, int, float]:
-    """Auto-detect the best VQC config from the Regime A checkpoint manifest."""
+    """Auto-detect the best VQC config from finalist_configs.json or Regime A checkpoint manifest."""
+    finalists_file = ckpt_dir.parent / "finalist_configs.json"
+    if finalists_file.exists():
+        try:
+            with open(finalists_file) as f:
+                finalists = json.load(f)
+            if finalists:
+                primary = finalists[0]
+                n_qubits = int(primary.get("n_qubits", 4))
+                n_layers = int(primary.get("n_layers", 2))
+                lr = float(primary.get("lr", 0.01))
+                print(f"  Auto-detect: using finalist config from {finalists_file.name} "
+                      f"q={n_qubits} l={n_layers} lr={lr}")
+                return n_qubits, n_layers, lr
+        except Exception:
+            pass
+
     manifest = ckpt_dir / "best_run_manifest.json"
     if manifest.exists():
         with open(manifest) as f:
@@ -140,7 +156,6 @@ def auto_detect_best_vqc_config(ckpt_dir: Path) -> Tuple[int, int, float]:
     return 4, 2, 0.01
 
 # ── Match to your best Regime A result ───────────────────────────────────────
-# This should follow the best validation-AUC sweep selection.
 N_QUBITS, N_LAYERS, VQC_LR = auto_detect_best_vqc_config(VQC_CKPT_DIR)
 
 # ── FL hyperparameters ────────────────────────────────────────────────────────
@@ -155,8 +170,6 @@ FL_CFG = {
 }
 
 # ── Non-IID partition: (benign_fraction, malignant_fraction) per client ───────
-# Reflects referral pattern: rural/peri-urban sees more early-stage (benign)
-# Urban tertiary sees more confirmed malignant referrals
 CLIENT_CFG = {
     "Tier1": {"label": "Tier 1 (Urban tertiary referral)",
                "benign_frac": 0.50, "malignant_frac": 0.50},
@@ -167,9 +180,8 @@ CLIENT_CFG = {
 }
 
 # ── Differential privacy simulation ─────────────────────────────────────────
-# σ_dp = 0.0 → no DP noise (baseline)
-# Run multiple σ values for privacy-utility trade-off curve
-DP_SIGMAS = [0.0, 0.01, 0.05, 0.10, 0.20]
+# Extended range across low, medium, and high noise to locate utility degradation cliff
+DP_SIGMAS = [0.0, 0.01, 0.05, 0.10, 0.20, 0.50, 1.0, 2.0]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1.  VQC ARCHITECTURE  (identical to 3_5_vqc.py — reproduced for
@@ -253,15 +265,32 @@ def load_pretrained_vqc(n_qubits: int, n_layers: int, lr: float) -> VQCModel:
     return model
 
 
+def find_optimal_threshold_youden(y_true, probs) -> float:
+    """Find optimal decision threshold maximizing Youden's J statistic (sensitivity + specificity - 1)."""
+    y_true = np.asarray(y_true)
+    probs = np.asarray(probs)
+    if len(set(y_true)) < 2:
+        return 0.5
+    fpr, tpr, thresholds = roc_curve(y_true, probs)
+    j_scores = tpr - fpr
+    best_idx = np.argmax(j_scores)
+    return float(thresholds[best_idx])
+
+
 class MicroMLPClassifier(nn.Module):
     """Minimal parameter-matched classical MLP used as a FedAvg baseline."""
     def __init__(self, input_dim: int = 4):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, 2)
+        self.act = nn.LeakyReLU(0.1)
         self.fc2 = nn.Linear(2, 1)
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
 
     def forward(self, x):
-        x = torch.relu(self.fc1(x))
+        x = self.act(self.fc1(x))
         return torch.sigmoid(self.fc2(x)).view(-1)
 
     def get_parameters(self) -> list:
@@ -395,12 +424,18 @@ def run_classical_fedavg_baseline(partitions: dict,
         val_p  = global_model(torch.tensor(X_val,  dtype=torch.float32)).numpy()
         test_p = global_model(torch.tensor(X_test, dtype=torch.float32)).numpy()
 
+    tau_c = find_optimal_threshold_youden(y_val, val_p)
+    test_preds = (test_p > 0.5).astype(int)
+    test_preds_opt = (test_p > tau_c).astype(int)
+
     return {
         "val_auc": round(roc_auc_score(y_val,  val_p), 4),
         "test_auc": round(roc_auc_score(y_test, test_p), 4),
         "test_aupr": round(average_precision_score(y_test, test_p) if len(set(y_test)) > 1 else 0.0, 4),
-        "test_f1": round(f1_score(y_test, (test_p > 0.5).astype(int), zero_division=0), 4),
-        "test_accuracy": round(accuracy_score(y_test, (test_p > 0.5).astype(int)), 4),
+        "test_f1": round(f1_score(y_test, test_preds, zero_division=0), 4),
+        "test_f1_opt": round(f1_score(y_test, test_preds_opt, zero_division=0), 4),
+        "opt_threshold": round(tau_c, 4),
+        "test_accuracy": round(accuracy_score(y_test, test_preds_opt), 4),
         "params": global_model.count_params(),
         "n_rounds": n_rounds,
     }
@@ -719,8 +754,10 @@ def run_federated_simulation(partitions: dict,
         test_auc = roc_auc_score(y_test, test_probs) if len(set(y_test)) > 1 else 0.0
         val_aupr = average_precision_score(y_val,  val_probs)  if len(set(y_val))  > 1 else 0.0
         test_aupr = average_precision_score(y_test, test_probs) if len(set(y_test)) > 1 else 0.0
+        tau_g    = find_optimal_threshold_youden(y_val, val_probs)
         val_f1   = f1_score(y_val,  (val_probs  > 0.5).astype(int), zero_division=0)
         test_f1  = f1_score(y_test, (test_probs > 0.5).astype(int), zero_division=0)
+        test_f1_opt = f1_score(y_test, (test_probs > tau_g).astype(int), zero_division=0)
 
         row = {
             "round":      round_num,
@@ -730,6 +767,8 @@ def run_federated_simulation(partitions: dict,
             "test_aupr":  round(test_aupr, 4),
             "val_f1":     round(val_f1,    4),
             "test_f1":    round(test_f1,   4),
+            "test_f1_opt": round(test_f1_opt, 4),
+            "opt_threshold": round(tau_g, 4),
             "dp_sigma":   dp_sigma,
         }
 
@@ -748,7 +787,7 @@ def run_federated_simulation(partitions: dict,
         if round_num % 5 == 0 or round_num == 1:
             print(f"  Round {round_num:3d}/{n_rounds} | "
                   f"Val AUC={val_auc:.4f} | Test AUC={test_auc:.4f} | Test AUPR={test_aupr:.4f} | "
-                  f"F1={test_f1:.4f} | σ_dp={dp_sigma}")
+                  f"F1={test_f1:.4f} (F1*={test_f1_opt:.4f}) | σ_dp={dp_sigma}")
 
     final_metrics = {
         "final_val_auc":   history[-1]["val_auc"],
@@ -756,6 +795,8 @@ def run_federated_simulation(partitions: dict,
         "final_test_auc":  history[-1]["test_auc"],
         "final_test_aupr": history[-1]["test_aupr"],
         "final_test_f1":   history[-1]["test_f1"],
+        "final_test_f1_opt": history[-1]["test_f1_opt"],
+        "opt_threshold":   history[-1]["opt_threshold"],
         "dp_sigma":        dp_sigma,
         "n_rounds":        n_rounds,
         "vqc_params":      global_model.count_params(),

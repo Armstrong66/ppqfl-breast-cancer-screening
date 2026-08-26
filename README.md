@@ -5,8 +5,6 @@
 [![PennyLane](https://img.shields.io/badge/PennyLane-0.41-brightgreen.svg)](https://pennylane.ai/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> Global Health Artificial Intelligence and Computing Laboratory - KCCR, KNUST, Ghana.
-
 ---
 
 ## Overview

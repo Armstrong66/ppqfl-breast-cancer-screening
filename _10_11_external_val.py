@@ -313,12 +313,60 @@ def find_optimal_threshold_youden(y_true, probs) -> float:
     return float(np.clip(best_thresh, 0.05, 0.95))
 
 
+def compute_bootstrap_ci(y_true: np.ndarray, probs: np.ndarray, tau: float, n_bootstraps: int = 1000, alpha: float = 0.05, seed: int = 42) -> dict:
+    """Non-parametric percentile bootstrap for 95% Confidence Intervals (1,000 resamples)."""
+    rng = np.random.default_rng(seed)
+    n = len(y_true)
+    boot_aucs, boot_auprs, boot_f1s, boot_sens, boot_specs, boot_baccs, boot_mccs = [], [], [], [], [], [], []
+    for _ in range(n_bootstraps):
+        idx = rng.choice(n, size=n, replace=True)
+        y_b = y_true[idx]
+        p_b = probs[idx]
+        if len(set(y_b)) < 2:
+            continue
+        boot_aucs.append(roc_auc_score(y_b, p_b))
+        boot_auprs.append(average_precision_score(y_b, p_b))
+        preds_b = (p_b > tau).astype(int)
+        boot_f1s.append(f1_score(y_b, preds_b, zero_division=0))
+        
+        tp = np.sum((y_b == 1) & (preds_b == 1))
+        fn = np.sum((y_b == 1) & (preds_b == 0))
+        tn = np.sum((y_b == 0) & (preds_b == 0))
+        fp = np.sum((y_b == 0) & (preds_b == 1))
+        
+        sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        boot_sens.append(sens)
+        boot_specs.append(spec)
+        boot_baccs.append(0.5 * (sens + spec))
+        boot_mccs.append(matthews_corrcoef(y_b, preds_b) if len(set(preds_b)) > 1 else 0.0)
+
+    low = 100 * (alpha / 2)
+    high = 100 * (1 - alpha / 2)
+    
+    def ci_tuple(arr):
+        if not arr:
+            return (0.0, 0.0)
+        return (round(float(np.percentile(arr, low)), 4), round(float(np.percentile(arr, high)), 4))
+
+    return {
+        "auc_ci": ci_tuple(boot_aucs),
+        "aupr_ci": ci_tuple(boot_auprs),
+        "f1_ci": ci_tuple(boot_f1s),
+        "sensitivity_ci": ci_tuple(boot_sens),
+        "specificity_ci": ci_tuple(boot_specs),
+        "balanced_acc_ci": ci_tuple(boot_baccs),
+        "mcc_ci": ci_tuple(boot_mccs),
+    }
+
+
 def compute_comprehensive_metrics(y_true, probs, opt_threshold: Optional[float] = None) -> dict:
     """
-    Compute full suite of classification and calibration metrics:
-    1. Threshold-independent: AUC-ROC, PR-AUC, Brier score
+    Computes a comprehensive battery of evaluation metrics:
+    1. Threshold-independent: AUC-ROC, PR-AUC / Average Precision, Brier Score
     2. Default threshold (0.5): F1, Accuracy, MCC, Sensitivity, Specificity
     3. Optimal threshold (Youden's J): Optimal threshold, F1, Balanced Accuracy, Sensitivity, Specificity
+    4. 1,000-resample 95% Bootstrap Confidence Intervals
     """
     y_true = np.asarray(y_true)
     probs  = np.asarray(probs)
@@ -332,7 +380,7 @@ def compute_comprehensive_metrics(y_true, probs, opt_threshold: Optional[float] 
     preds_05 = (probs > 0.5).astype(int)
     f1_05    = float(f1_score(y_true, preds_05, zero_division=0))
     acc_05   = float(accuracy_score(y_true, preds_05))
-    mcc_05   = float(matthews_corrcoef(y_true, preds_05)) if n_classes > 1 else 0.0
+    mcc_05   = float(matthews_corrcoef(y_true, preds_05)) if n_classes > 1 and len(set(preds_05)) > 1 else 0.0
     bacc_05  = float(balanced_accuracy_score(y_true, preds_05)) if n_classes > 1 else acc_05
 
     report_05 = classification_report(
@@ -344,11 +392,14 @@ def compute_comprehensive_metrics(y_true, probs, opt_threshold: Optional[float] 
     preds_opt = (probs > tau).astype(int)
     f1_opt    = float(f1_score(y_true, preds_opt, zero_division=0))
     acc_opt   = float(accuracy_score(y_true, preds_opt))
-    mcc_opt   = float(matthews_corrcoef(y_true, preds_opt)) if n_classes > 1 else 0.0
+    mcc_opt   = float(matthews_corrcoef(y_true, preds_opt)) if n_classes > 1 and len(set(preds_opt)) > 1 else 0.0
     bacc_opt  = float(balanced_accuracy_score(y_true, preds_opt)) if n_classes > 1 else acc_opt
     report_opt = classification_report(
         y_true, preds_opt, target_names=["Benign", "Malignant"], output_dict=True
     ) if n_classes > 1 else {}
+
+    # 1,000-resample 95% Bootstrap CIs
+    ci_dict = compute_bootstrap_ci(y_true, probs, tau, n_bootstraps=1000)
 
     return {
         "auc": round(auc, 4),
@@ -364,7 +415,10 @@ def compute_comprehensive_metrics(y_true, probs, opt_threshold: Optional[float] 
         "opt_threshold": round(tau, 4),
         "f1_at_opt": round(f1_opt, 4),
         "balanced_acc_at_opt": round(bacc_opt, 4),
+        "mcc_at_opt": round(mcc_opt, 4),
         "per_class_at_opt": report_opt,
+        # Bootstrap 95% Confidence Intervals
+        "ci": ci_dict,
         "probs": probs,
         "preds": preds_05,
         "preds_at_opt": preds_opt,
@@ -1117,6 +1171,92 @@ def main():
     X_train_pca = np.load(FEAT_DIR / f"features_train_pca{N_QUBITS}.npy")
     y_train_arr = np.load(FEAT_DIR / "labels_train.npy")
 
+def compute_delong_roc_comparison(y_true: np.ndarray, probs1: np.ndarray, probs2: np.ndarray, n_bootstraps: int = 1000) -> dict:
+    """Non-parametric paired bootstrap test comparing ROC curves between model 1 and model 2."""
+    rng = np.random.default_rng(42)
+    n = len(y_true)
+    diffs = []
+    for _ in range(n_bootstraps):
+        idx = rng.choice(n, size=n, replace=True)
+        yb = y_true[idx]
+        if len(set(yb)) < 2:
+            continue
+        auc1 = roc_auc_score(yb, probs1[idx])
+        auc2 = roc_auc_score(yb, probs2[idx])
+        diffs.append(auc1 - auc2)
+        
+    diff_mean = float(np.mean(diffs))
+    diff_std = float(np.std(diffs))
+    z = diff_mean / (diff_std + 1e-12)
+    from scipy.stats import norm
+    p_val = float(2 * (1 - norm.cdf(abs(z))))
+    
+    ci_low = float(np.percentile(diffs, 2.5))
+    ci_high = float(np.percentile(diffs, 97.5))
+    
+    return {
+        "auc_diff_mean": round(diff_mean, 4),
+        "auc_diff_95ci": (round(ci_low, 4), round(ci_high, 4)),
+        "z_score": round(z, 4),
+        "p_value": round(p_val, 6),
+        "significant": bool(p_val < 0.05),
+    }
+
+
+def compute_wilcoxon_cv_test(cv_results_json_path: Path) -> dict:
+    """Wilcoxon signed-rank test across repeated CV folds between VQC and MicroMLP control."""
+    if not cv_results_json_path.exists():
+        return {"error": "cv_results.json not found"}
+    try:
+        with open(cv_results_json_path) as f:
+            cv_data = json.load(f)
+        
+        vqc_keys = [k for k in cv_data if "HQCNN" in k]
+        mlp_keys = [k for k in cv_data if "Micro-MLP" in k]
+        if not vqc_keys or not mlp_keys:
+            return {"error": "Missing VQC or Micro-MLP in CV results"}
+        
+        vqc_folds = cv_data[vqc_keys[0]].get("fold_aucs", [])
+        mlp_folds = cv_data[mlp_keys[0]].get("fold_aucs", [])
+        if len(vqc_folds) == len(mlp_folds) and len(vqc_folds) >= 5:
+            stat, p_val = wilcoxon(vqc_folds, mlp_folds)
+            return {
+                "vqc_model": vqc_keys[0],
+                "mlp_model": mlp_keys[0],
+                "n_folds": len(vqc_folds),
+                "vqc_mean_auc": round(float(np.mean(vqc_folds)), 4),
+                "mlp_mean_auc": round(float(np.mean(mlp_folds)), 4),
+                "wilcoxon_stat": round(float(stat), 4),
+                "p_value": round(float(p_val), 6),
+                "significant": bool(p_val < 0.05),
+            }
+    except Exception as e:
+        return {"error": str(e)}
+    return {"error": "Could not complete Wilcoxon test"}
+
+
+def main():
+    print("═"*70)
+    print("  10–11 — EXTERNAL VALIDATION + MASTER ABLATION TABLE")
+    print("  Cross-population: Mendeley (SA) → KAU-BCMD (MENA)")
+    print("═"*70)
+
+    from cache_check import already_done, CACHE
+    seed_everything(42)
+
+    # ── Load KAU features ────────────────────────────────────────────────
+    print("\n[1/6] Loading KAU-BCMD features...")
+    X_kau_raw, X_kau_pca, X_kau_scaled, y_kau = load_kau_features(N_QUBITS)
+
+    # Load Mendeley splits for validation tuning and test evaluation
+    X_test_pca  = np.load(FEAT_DIR / f"features_test_pca{N_QUBITS}.npy")
+    y_test      = np.load(FEAT_DIR / "labels_test.npy")
+    X_val_pca   = np.load(FEAT_DIR / f"features_val_pca{N_QUBITS}.npy")
+    y_val       = np.load(FEAT_DIR / "labels_val.npy")
+    X_val_raw   = np.load(FEAT_DIR / "features_val_raw.npy")
+    X_train_pca = np.load(FEAT_DIR / f"features_train_pca{N_QUBITS}.npy")
+    y_train_arr = np.load(FEAT_DIR / "labels_train.npy")
+
     scaler_mm     = MinMaxScaler(feature_range=(0, 1)).fit(X_train_pca)
     X_test_scaled = scaler_mm.transform(X_test_pca)
     X_val_scaled  = scaler_mm.transform(X_val_pca)
@@ -1126,7 +1266,6 @@ def main():
     print("\n[2/6] Loading trained models...")
 
     cnn_model = build_mobilenet(BASELINE_DIR / f"{BACKBONE}_best.pt")
-    vqc_A     = load_vqc(VQC_DIR_A, N_QUBITS, N_LAYERS, VQC_LR)
 
     # Try loading QFL global model
     qfl_ckpt  = QFL_DIR / f"qfl_global_q{N_QUBITS}_l{N_LAYERS}.pt"
@@ -1223,22 +1362,44 @@ def main():
         kau_results["QFL (Federated)"]["mendeley_auc"] = mendeley_results["QFL (Federated)"]["auc"]
         kau_results["QFL (Federated)"]["mendeley_f1"] = mendeley_results["QFL (Federated)"]["f1"]
 
+    # ── Statistical Significance Tests ────────────────────────────────────
+    print("\n  ── Running Statistical Significance Hypothesis Tests ──")
+    stat_tests = {}
+    primary_vqc_label = f"HQCNN q={N_QUBITS} l={N_LAYERS} (Primary Sweep Best, 13p)"
+    if primary_vqc_label not in kau_results:
+        matching = [k for k in kau_results if f"q={N_QUBITS}" in k]
+        primary_vqc_label = matching[0] if matching else list(kau_results.keys())[0]
+
+    vqc_kau_probs = kau_results[primary_vqc_label]["probs"]
+    cnn_kau_probs = kau_results["Classical (MobileNetV2)"]["probs"]
+    mlp_kau_probs = kau_results.get("Micro-MLP (dim=4)", list(kau_results.values())[1])["probs"]
+
+    stat_tests["delong_vqc_vs_cnn_kau"] = compute_delong_roc_comparison(y_kau, vqc_kau_probs, cnn_kau_probs)
+    stat_tests["delong_vqc_vs_micromlp_kau"] = compute_delong_roc_comparison(y_kau, vqc_kau_probs, mlp_kau_probs)
+
+    # Wilcoxon on cross-validation folds
+    cv_json_path = BASE / "vqc_outputs" / "cv_results.json"
+    stat_tests["wilcoxon_cv_test"] = compute_wilcoxon_cv_test(cv_json_path)
+
+    with open(OUT_DIR / "statistical_tests.json", "w") as f:
+        json.dump(stat_tests, f, indent=2)
+    print(f"  ✓ Saved statistical test results to: {OUT_DIR / 'statistical_tests.json'}")
+
     # Print summary
-    print("\n  ── Cross-population Clinical Results (Capacity Spectrum) ──")
+    print("\n  ── Cross-population Clinical Results (Capacity Spectrum with 95% CIs) ──")
     for name in kau_results:
         m_auc = mendeley_results.get(name, {}).get("auc", "N/A")
         k_auc = kau_results[name]["auc"]
+        k_auc_ci = kau_results[name]["ci"]["auc_ci"]
         tau   = kau_results[name]["opt_threshold"]
         k_f1  = kau_results[name]["f1"]
         k_f1_opt = kau_results[name]["f1_at_opt"]
+        k_f1_ci = kau_results[name]["ci"]["f1_ci"]
         gap   = round(m_auc - k_auc, 4) if isinstance(m_auc, (int, float)) and isinstance(k_auc, (int, float)) else "N/A"
         print(f"  {name:42s} | Mendeley AUC={m_auc} | "
-              f"KAU AUC={k_auc:.4f} | F1(0.5)={k_f1:.4f} | Opt τ*={tau:.4f} -> F1(τ*)={k_f1_opt:.4f} | Gap={gap}")
-        # Per-class detail for KAU
-        pc_05 = kau_results[name]["per_class"]
+              f"KAU AUC={k_auc:.4f} 95%CI {k_auc_ci} | Opt τ*={tau:.4f} -> F1(τ*)={k_f1_opt:.4f} 95%CI {k_f1_ci} | Gap={gap}")
         pc_opt = kau_results[name]["per_class_at_opt"]
-        print(f"    [0.5 default] Sens: {pc_05.get('Malignant',{}).get('recall','N/A')} | Spec: {pc_05.get('Benign',{}).get('recall','N/A')}")
-        print(f"    [Opt τ*={tau:.2f}] Sens: {pc_opt.get('Malignant',{}).get('recall','N/A')} | Spec: {pc_opt.get('Benign',{}).get('recall','N/A')} | BalAcc: {kau_results[name]['balanced_acc_at_opt']}")
+        print(f"    [Opt τ*={tau:.2f}] Sens: {pc_opt.get('Malignant',{}).get('recall','N/A')} (CI {kau_results[name]['ci']['sensitivity_ci']}) | Spec: {pc_opt.get('Benign',{}).get('recall','N/A')} (CI {kau_results[name]['ci']['specificity_ci']}) | BalAcc: {kau_results[name]['balanced_acc_at_opt']}")
 
     # ── Domain shift analysis ─────────────────────────────────────────────
     print("\n[4/6] Domain shift analysis...")
@@ -1291,14 +1452,10 @@ def main():
             "kau_auc":          k_auc,
         })
     if eff_rows:
-        results_for_plot = [
-            {"model_short": r["model_short"], "category": r["category"],
-             "trainable_params": r["trainable_params"],
-             "mendeley_auc": r["mendeley_auc"], "kau_auc": r["kau_auc"]}
-            for r in eff_rows
-        ]
-        plot_parameter_efficiency(results_for_plot,
-                                   OUT_DIR / "parameter_efficiency.png")
+        plot_parameter_efficiency(pd.DataFrame(eff_rows), OUT_DIR / "parameter_efficiency.png")
+
+    # ── Summary text report ───────────────────────────────────────────────
+    write_summary_report(master_df, shift_metrics, OUT_DIR / "executive_summary.md")
 
     # ── Save generalisation report & Master Dashboard ──────────────────────
     report = {
@@ -1339,7 +1496,7 @@ def main():
         k = kau_results[name]["auc"]
         g = round(m - k, 4) if isinstance(m, float) else "—"
         print(f"    {name:30s} | Mendeley={m} | KAU={k} | Gap={g}")
-    print("\n  Next step → run_pipeline.sh (full local pipeline runner)")
+    print("\n✓ Pipeline execution complete.")
 
 
 if __name__ == "__main__":

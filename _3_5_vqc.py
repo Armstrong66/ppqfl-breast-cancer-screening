@@ -53,10 +53,12 @@ from pennylane import numpy as pnp
 
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.metrics import (
     accuracy_score, f1_score, roc_auc_score,
     average_precision_score, confusion_matrix,
-    classification_report, roc_curve
+    classification_report, roc_curve, matthews_corrcoef,
+    balanced_accuracy_score, brier_score_loss
 )
 
 from pipeline_utils import seed_everything
@@ -154,43 +156,33 @@ def make_loaders(X_train, y_train, X_val, y_val, X_test, y_test, batch_size):
 # 2.  VQC ARCHITECTURE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_vqc(n_qubits: int, n_layers: int):
+def build_vqc(n_qubits: int, n_layers: int, reupload: bool = True):
     """
     Build a PennyLane VQC as a PyTorch-compatible nn.Module layer.
 
     Circuit structure (repeated n_layers times):
-      1. Angle encoding:   RY(π·x_i) on qubit i   (data re-uploading each layer)
+      1. Angle encoding:   RY(π·x_i) on qubit i (if layer==0 or reupload==True)
       2. Variational layer: RY(θ_i) on each qubit
       3. Entanglement:      CNOT in circular pattern (0→1→2→...→n-1→0)
 
     Measurement: expectation value ⟨Z₀⟩ on qubit 0 → scalar in [-1, 1]
-    Mapped to [0, 1] probability via (1 + ⟨Z₀⟩) / 2 for BCE loss.
+    Mapped to [0, 1] probability via sigmoid(⟨Z₀⟩ + bias) for BCE loss.
 
-    Data re-uploading (encoding at each layer) is a key design choice:
-    it allows the VQC to express non-linear functions of the input beyond
-    what a single encoding layer can achieve — critical for 4–6 features.
-    Reference: Pérez-Salinas et al. (2020) "Data re-uploading for a universal
-    quantum classifier."
+    Data re-uploading (reupload=True) allows the VQC to express higher-frequency
+    Fourier components, increasing non-linear expressivity.
     """
     dev = qml.device("default.qubit", wires=n_qubits)
 
     @qml.qnode(dev, interface="torch", diff_method="parameter-shift")
     def circuit(inputs, weights):
-        """
-        inputs  : (n_qubits,)  — MinMax-scaled PCA features in [0,1]
-        weights : (n_layers, n_qubits)  — trainable VQC parameters
-        """
         for layer in range(n_layers):
-            # ── Angle encoding (data re-uploading each layer) ──
-            for i in range(n_qubits):
-                qml.RY(np.pi * inputs[i], wires=i)
-            # ── Variational RY rotations ──
+            if layer == 0 or reupload:
+                for i in range(n_qubits):
+                    qml.RY(np.pi * inputs[i], wires=i)
             for i in range(n_qubits):
                 qml.RY(weights[layer, i], wires=i)
-            # ── Circular CNOT entanglement ──
             for i in range(n_qubits):
                 qml.CNOT(wires=[i, (i + 1) % n_qubits])
-
         return qml.expval(qml.PauliZ(0))
 
     weight_shapes = {"weights": (n_layers, n_qubits)}
@@ -201,27 +193,18 @@ class HQCNNClassifier(nn.Module):
     """
     Hybrid Quantum-Classical Neural Network:
       Input (n_qubits,) → VQC → scalar ⟨Z₀⟩ → sigmoid → P(malignant)
-
-    Regime A (frozen classical): only this module's parameters are trained.
-    Regime B (end-to-end): this + CNN head parameters trained jointly.
-
-    The module handles single-sample and batched input transparently.
     """
-    def __init__(self, n_qubits: int, n_layers: int):
+    def __init__(self, n_qubits: int, n_layers: int, reupload: bool = True):
         super().__init__()
         self.n_qubits = n_qubits
         self.n_layers = n_layers
-        self.vqc      = build_vqc(n_qubits, n_layers)
-        # Learnable bias term after VQC measurement (improves calibration)
+        self.reupload = reupload
+        self.vqc      = build_vqc(n_qubits, n_layers, reupload=reupload)
         self.bias     = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
-        # x: (batch, n_qubits) — already MinMax scaled to [0,1]
-        # VQC processes each sample independently
         out = torch.stack([self.vqc(x[i]) for i in range(x.shape[0])])
-        # Map ⟨Z⟩ ∈ [-1,1] to probability ∈ (0,1)
-        prob = torch.sigmoid(out + self.bias)
-        return prob   # shape: (batch,)
+        return torch.sigmoid(out + self.bias)
 
     def count_params(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -229,22 +212,38 @@ class HQCNNClassifier(nn.Module):
 
 class ClassicalMicroMLP(nn.Module):
     """Minimal classical MLP baseline matched to the VQC parameter budget."""
-    def __init__(self, input_dim: int):
+    def __init__(self, input_dim: int, hidden_dim: int = 2):
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, 2)
-        self.fc2 = nn.Linear(2, 1)
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.act = nn.LeakyReLU(0.1)
+        self.fc2 = nn.Linear(hidden_dim, 1)
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
 
     def forward(self, x):
-        x = torch.relu(self.fc1(x))
+        x = self.act(self.fc1(x))
         return torch.sigmoid(self.fc2(x)).view(-1)
 
     def count_params(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+def find_optimal_threshold_youden(y_true, probs) -> float:
+    """Find optimal classification threshold maximizing Youden's J = TPR - FPR on validation set."""
+    if len(set(y_true)) < 2:
+        return 0.5
+    fpr, tpr, thresholds = roc_curve(y_true, probs)
+    j_scores = tpr - fpr
+    best_idx = int(np.argmax(j_scores))
+    best_thresh = float(thresholds[best_idx])
+    return float(np.clip(best_thresh, 0.05, 0.95))
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 3.  TRAINING LOOP
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 def train_epoch(model, loader, criterion, optimizer):
     model.train()
@@ -265,34 +264,48 @@ def train_epoch(model, loader, criterion, optimizer):
 
 
 @torch.no_grad()
-def eval_epoch(model, loader, criterion):
+def eval_epoch(model, loader, criterion, opt_threshold: float = None):
     model.eval()
-    total_loss, preds_all, probs_all, labels_all = 0.0, [], [], []
+    total_loss, probs_all, labels_all = 0.0, [], []
     for X_batch, y_batch in loader:
         probs  = model(X_batch)
         loss   = criterion(probs, y_batch.float())
         total_loss += loss.item() * X_batch.size(0)
         probs_all.extend(probs.numpy())
-        preds_all.extend((probs > 0.5).long().numpy())
         labels_all.extend(y_batch.numpy())
     n   = len(loader.dataset)
-    acc = accuracy_score(labels_all, preds_all)
-    f1  = f1_score(labels_all, preds_all, zero_division=0)
-    auc = roc_auc_score(labels_all, probs_all) if len(set(labels_all)) > 1 else 0.0
-    aupr = average_precision_score(labels_all, probs_all) if len(set(labels_all)) > 1 else 0.0
-    return total_loss / n, acc, f1, auc, aupr, labels_all, preds_all, probs_all
+    probs_np = np.array(probs_all)
+    labels_np = np.array(labels_all)
+    
+    # Threshold metrics: standard 0.5
+    preds_05 = (probs_np > 0.5).astype(int)
+    acc_05 = accuracy_score(labels_np, preds_05)
+    f1_05  = f1_score(labels_np, preds_05, zero_division=0)
+    
+    # Threshold metrics: optimal threshold
+    tau = opt_threshold if opt_threshold is not None else find_optimal_threshold_youden(labels_np, probs_np)
+    preds_opt = (probs_np > tau).astype(int)
+    acc_opt = accuracy_score(labels_np, preds_opt)
+    f1_opt  = f1_score(labels_np, preds_opt, zero_division=0)
+    bal_acc = balanced_accuracy_score(labels_np, preds_opt) if len(set(labels_np)) > 1 else acc_opt
+    mcc_opt = matthews_corrcoef(labels_np, preds_opt) if len(set(labels_np)) > 1 else 0.0
+
+    auc = roc_auc_score(labels_np, probs_np) if len(set(labels_np)) > 1 else 0.0
+    aupr = average_precision_score(labels_np, probs_np) if len(set(labels_np)) > 1 else 0.0
+    return total_loss / n, acc_05, f1_05, auc, aupr, labels_all, preds_opt, probs_all, f1_opt, tau, bal_acc, mcc_opt
 
 
 def train_vqc(n_qubits: int, n_layers: int, lr: float,
               train_dl, val_dl, out_subdir: Path,
-              label: str = "", noise_sigma: float = 0.0) -> dict:
+              label: str = "", noise_sigma: float = 0.0,
+              reupload: bool = True) -> dict:
     """
     Full training run for one VQC configuration.
     Returns a results dict with test metrics and parameter count.
     """
     out_subdir.mkdir(parents=True, exist_ok=True)
     seed_everything(42)
-    model     = HQCNNClassifier(n_qubits, n_layers)
+    model     = HQCNNClassifier(n_qubits, n_layers, reupload=reupload)
     criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -302,10 +315,10 @@ def train_vqc(n_qubits: int, n_layers: int, lr: float,
     best_auc, best_aupr, best_state, patience_ctr = 0.0, 0.0, None, 0
     history = []
 
-    print(f"    Training: qubits={n_qubits} layers={n_layers} lr={lr} {label}")
+    print(f"    Training: qubits={n_qubits} layers={n_layers} lr={lr} reupload={reupload} {label}")
     for epoch in range(1, TRAIN_CFG["num_epochs"] + 1):
         tr_loss, tr_acc, tr_f1 = train_epoch(model, train_dl, criterion, optimizer)
-        vl_loss, vl_acc, vl_f1, vl_auc, vl_aupr, _, _, _ = eval_epoch(model, val_dl, criterion)
+        vl_loss, vl_acc, vl_f1, vl_auc, vl_aupr, _, _, _, vl_f1_opt, _, _, _ = eval_epoch(model, val_dl, criterion)
         scheduler.step(vl_auc)
 
         is_best = vl_auc > best_auc
@@ -321,18 +334,20 @@ def train_vqc(n_qubits: int, n_layers: int, lr: float,
             "epoch": epoch,
             "train_loss": tr_loss, "train_acc": tr_acc,
             "val_loss": vl_loss, "val_auc": vl_auc,
-            "val_aupr": vl_aupr, "is_best": is_best,
+            "val_aupr": vl_aupr, "val_f1": vl_f1, "val_f1_opt": vl_f1_opt,
+            "is_best": is_best,
         })
         if epoch % 10 == 0 or is_best:
             print(f"      Ep {epoch:3d} | TrLoss {tr_loss:.4f} | "
-                  f"VlAUC {vl_auc:.4f}" + (" ← best" if is_best else ""))
+                  f"VlAUC {vl_auc:.4f} | VlF1(τ*) {vl_f1_opt:.4f}" + (" ← best" if is_best else ""))
 
         if patience_ctr >= TRAIN_CFG["patience"]:
             print(f"      Early stopping at epoch {epoch}.")
             break
 
     # Save checkpoint + history
-    ckpt_name = f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt"
+    suffix = "" if reupload else "_noreupload"
+    ckpt_name = f"vqc_q{n_qubits}_l{n_layers}_lr{lr}{suffix}.pt"
     torch.save(best_state, out_subdir / ckpt_name)
     pd.DataFrame(history).to_csv(out_subdir / ckpt_name.replace(".pt", "_history.csv"),
                                  index=False, encoding="utf-8-sig")
@@ -341,6 +356,7 @@ def train_vqc(n_qubits: int, n_layers: int, lr: float,
         "n_qubits":      n_qubits,
         "n_layers":      n_layers,
         "lr":            lr,
+        "reupload":      reupload,
         "noise_sigma":   noise_sigma,
         "best_val_auc":  round(best_auc, 4),
         "best_val_aupr": round(best_aupr, 4),
@@ -354,20 +370,30 @@ def train_vqc(n_qubits: int, n_layers: int, lr: float,
 # 4.  EVALUATION & PLOTTING UTILITIES
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_evaluate(result: dict, test_dl) -> dict:
-    """Load best weights and evaluate on test set."""
+def test_evaluate(result: dict, test_dl, val_dl=None) -> dict:
+    """Load best weights, calibrate threshold on validation set, and evaluate on test set."""
     model = result["model_ref"]
     model.load_state_dict(result["best_state"])
     criterion = nn.BCELoss()
-    _, ts_acc, ts_f1, ts_auc, ts_aupr, y_true, y_pred, y_prob = eval_epoch(
-        model, test_dl, criterion
+    
+    # Tune optimal threshold on validation set if provided
+    opt_tau = 0.5
+    if val_dl is not None:
+        _, _, _, _, _, _, _, val_probs, _, opt_tau, _, _ = eval_epoch(model, val_dl, criterion)
+
+    _, ts_acc, ts_f1, ts_auc, ts_aupr, y_true, y_pred, y_prob, ts_f1_opt, _, ts_bal_acc, ts_mcc = eval_epoch(
+        model, test_dl, criterion, opt_threshold=opt_tau
     )
     return {
         **{k: v for k, v in result.items() if k not in ("best_state", "model_ref")},
-        "test_accuracy": round(ts_acc, 4),
-        "test_f1":       round(ts_f1,  4),
-        "test_auc_roc":  round(ts_auc, 4),
-        "test_aupr":     round(ts_aupr, 4),
+        "test_accuracy":     round(ts_acc, 4),
+        "test_f1":           round(ts_f1,  4),
+        "test_f1_opt":       round(ts_f1_opt, 4),
+        "opt_threshold":     round(opt_tau, 4),
+        "test_balanced_acc": round(ts_bal_acc, 4),
+        "test_mcc":          round(ts_mcc, 4),
+        "test_auc_roc":      round(ts_auc, 4),
+        "test_aupr":         round(ts_aupr, 4),
         "y_true": y_true, "y_pred": y_pred, "y_prob": y_prob,
     }
 
@@ -477,10 +503,15 @@ class ClassicalParamMatchedMLP(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.act = nn.LeakyReLU(0.1)
         self.fc2 = nn.Linear(hidden_dim, 1)
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
 
     def forward(self, x):
-        x = torch.relu(self.fc1(x))
+        x = self.act(self.fc1(x))
         return torch.sigmoid(self.fc2(x)).view(-1)
 
     def count_params(self):
@@ -532,9 +563,13 @@ def run_parameter_matched_mlp_baselines(top_runs: list) -> list:
         model.load_state_dict(best_state if best_state is not None else model.state_dict())
         model.eval()
         with torch.no_grad():
+            val_probs = model(torch.tensor(X_val, dtype=torch.float32)).numpy()
             test_probs = model(torch.tensor(X_test, dtype=torch.float32)).numpy()
+            
+        tau_mlp = find_optimal_threshold_youden(y_val, val_probs)
         test_preds = (test_probs > 0.5).astype(int)
-        val_aupr = average_precision_score(y_val, model(torch.tensor(X_val, dtype=torch.float32)).detach().numpy()) if len(set(y_val)) > 1 else 0.0
+        test_preds_opt = (test_probs > tau_mlp).astype(int)
+        val_aupr = average_precision_score(y_val, val_probs) if len(set(y_val)) > 1 else 0.0
         test_aupr = average_precision_score(y_test, test_probs) if len(set(y_test)) > 1 else 0.0
 
         results.append({
@@ -549,6 +584,8 @@ def run_parameter_matched_mlp_baselines(top_runs: list) -> list:
             "test_auc_roc": round(roc_auc_score(y_test, test_probs), 4),
             "test_aupr": round(test_aupr, 4),
             "test_f1": round(f1_score(y_test, test_preds, zero_division=0), 4),
+            "test_f1_opt": round(f1_score(y_test, test_preds_opt, zero_division=0), 4),
+            "opt_threshold": round(tau_mlp, 4),
             "test_accuracy": round(accuracy_score(y_test, test_preds), 4),
             "notes": f"Param-matched classical MLP for VQC q={n_qubits} l={run['n_layers']}",
         })
@@ -703,9 +740,6 @@ def plot_ablation_table(df: pd.DataFrame, save_path: Path):
 def run_regime_A() -> list:
     """
     Regime A: classical backbone frozen, only VQC parameters trained.
-    Run the recommended starting configuration (n=4, l=2) first,
-    then the best sweep config.
-    Returns list of result dicts.
     """
     print("\n" + "═"*70)
     print("  REGIME A — Frozen Classical + Train VQC")
@@ -714,7 +748,6 @@ def run_regime_A() -> list:
     results = []
     seed_everything(42)
 
-    # Primary config: 4 qubits, 2 layers (safest starting point)
     for n_qubits, n_layers, lr in [(4, 2, 0.01), (6, 2, 0.01), (8, 2, 0.01)]:
         X_train, y_train, X_val, y_val, X_test, y_test, _ = load_split(n_qubits)
         train_dl, val_dl, test_dl = make_loaders(
@@ -722,11 +755,10 @@ def run_regime_A() -> list:
             TRAIN_CFG["batch_size"]
         )
         res = train_vqc(n_qubits, n_layers, lr, train_dl, val_dl, out,
-                        label="[Regime A]")
+                        label="[Regime A]", reupload=True)
         res["regime"] = "A — frozen classical + VQC"
-        res = test_evaluate(res, test_dl)
+        res = test_evaluate(res, test_dl, val_dl=val_dl)
 
-        # Diagnostic plots
         ckpt_name = f"vqc_q{n_qubits}_l{n_layers}_lr{lr}"
         history_csv = out / f"{ckpt_name}_history.csv"
         if history_csv.exists():
@@ -745,7 +777,7 @@ def run_regime_A() -> list:
             f"HQCNN Regime A q={n_qubits}",
             out / f"{ckpt_name}_roc.png"
         )
-        print(f"    Test AUC={res['test_auc_roc']:.4f} F1={res['test_f1']:.4f} "
+        print(f"    Test AUC={res['test_auc_roc']:.4f} F1(0.5)={res['test_f1']:.4f} F1(τ*)={res['test_f1_opt']:.4f} "
               f"Params={res['vqc_params']}")
         results.append(res)
 
@@ -759,14 +791,6 @@ def run_regime_A() -> list:
 def run_regime_B() -> list:
     """
     Regime B: CNN head + VQC parameters optimised jointly.
-    We simulate this by loading the saved CNN features but adding a small
-    learnable linear layer before the VQC — representing the unfrozen head —
-    and training both together.
-
-    Note: True end-to-end would require running the CNN forward pass inside
-    the training loop (expensive on CPU for quantum simulation). This
-    approximation trains a learnable projection (dim → n_qubits) jointly with
-    the VQC, which is architecturally equivalent for the quantum component.
     """
     print("\n" + "═"*70)
     print("  REGIME B — End-to-End Joint Training (CNN projection + VQC)")
@@ -782,15 +806,14 @@ def run_regime_B() -> list:
             TRAIN_CFG["batch_size"]
         )
 
-        # Wrap: learnable linear projection + VQC
         class RegimeBModel(nn.Module):
             def __init__(self, in_dim, n_qubits, n_layers):
                 super().__init__()
                 self.proj = nn.Sequential(
                     nn.Linear(in_dim, n_qubits),
-                    nn.Sigmoid(),        # keep outputs in (0,1) for angle encoding
+                    nn.Sigmoid(),
                 )
-                self.hqcnn = HQCNNClassifier(n_qubits, n_layers)
+                self.hqcnn = HQCNNClassifier(n_qubits, n_layers, reupload=True)
 
             def forward(self, x):
                 return self.hqcnn(self.proj(x))
@@ -811,7 +834,6 @@ def run_regime_B() -> list:
         print(f"    Training: qubits={n_qubits} layers={n_layers} lr={lr} [Regime B]")
 
         for epoch in range(1, TRAIN_CFG["num_epochs"] + 1):
-            # Inline train/eval since model wraps differently
             model.train()
             for X_batch, y_batch in train_dl:
                 optimizer.zero_grad()
@@ -849,13 +871,20 @@ def run_regime_B() -> list:
         pd.DataFrame(history).to_csv(
             out / f"regimeB_q{n_qubits}_l{n_layers}_history.csv", index=False, encoding="utf-8-sig"
         )
-        # Save best checkpoint (needed by 6_7_uq.py)
-        torch.save(best_state,
-                   out / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt")
+        torch.save(best_state, out / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt")
 
-        # Test evaluation
+        # Test evaluation with validation-tuned threshold
         model.load_state_dict(best_state)
         model.eval()
+        
+        # Determine optimal threshold on validation set
+        vl_probs_all, vl_labels_all = [], []
+        with torch.no_grad():
+            for X_b, y_b in val_dl:
+                vl_probs_all.extend(model(X_b).numpy())
+                vl_labels_all.extend(y_b.numpy())
+        tau_b = find_optimal_threshold_youden(vl_labels_all, vl_probs_all)
+
         ts_probs, ts_preds, ts_labels = [], [], []
         with torch.no_grad():
             for X_batch, y_batch in test_dl:
@@ -864,10 +893,15 @@ def run_regime_B() -> list:
                 ts_preds.extend((p > 0.5).long().numpy())
                 ts_labels.extend(y_batch.numpy())
 
-        ts_auc = roc_auc_score(ts_labels, ts_probs)
-        ts_aupr = average_precision_score(ts_labels, ts_probs) if len(set(ts_labels)) > 1 else 0.0
-        ts_f1  = f1_score(ts_labels, ts_preds, zero_division=0)
-        ts_acc = accuracy_score(ts_labels, ts_preds)
+        ts_probs_np = np.array(ts_probs)
+        ts_labels_np = np.array(ts_labels)
+        ts_preds_opt = (ts_probs_np > tau_b).astype(int)
+        
+        ts_auc = roc_auc_score(ts_labels_np, ts_probs_np) if len(set(ts_labels_np)) > 1 else 0.0
+        ts_aupr = average_precision_score(ts_labels_np, ts_probs_np) if len(set(ts_labels_np)) > 1 else 0.0
+        ts_f1  = f1_score(ts_labels_np, (ts_probs_np > 0.5).astype(int), zero_division=0)
+        ts_f1_opt = f1_score(ts_labels_np, ts_preds_opt, zero_division=0)
+        ts_acc = accuracy_score(ts_labels_np, ts_preds_opt)
  
         res = {
             "n_qubits": n_qubits, "n_layers": n_layers, "lr": lr,
@@ -879,15 +913,17 @@ def run_regime_B() -> list:
             "test_auc_roc": round(ts_auc, 4),
             "test_aupr": round(ts_aupr, 4),
             "test_f1":      round(ts_f1,  4),
+            "test_f1_opt":  round(ts_f1_opt, 4),
+            "opt_threshold": round(tau_b, 4),
             "test_accuracy":round(ts_acc, 4),
-            "y_true": ts_labels, "y_pred": ts_preds, "y_prob": ts_probs,
+            "y_true": ts_labels, "y_pred": ts_preds_opt, "y_prob": ts_probs,
         }
         plot_confusion_matrix(
-            ts_labels, ts_preds,
+            ts_labels, ts_preds_opt,
             f"Regime B — q={n_qubits} l={n_layers}",
             out / f"regimeB_q{n_qubits}_l{n_layers}_cm.png"
         )
-        print(f"    Test AUC={ts_auc:.4f} F1={ts_f1:.4f} Params={model.count_params()}")
+        print(f"    Test AUC={ts_auc:.4f} F1(0.5)={ts_f1:.4f} F1(τ*)={ts_f1_opt:.4f} Params={model.count_params()}")
         results.append(res)
 
     return results
@@ -900,7 +936,6 @@ def run_regime_B() -> list:
 def run_sweep() -> list:
     """
     Grid sweep over SWEEP_CFG. Runs Regime A for each combination.
-    Expensive — set SWEEP_CFG small or run overnight.
     """
     print("\n" + "═"*70)
     print("  HYPERPARAMETER SWEEP (Regime A)")
@@ -923,16 +958,14 @@ def run_sweep() -> list:
             TRAIN_CFG["batch_size"]
         )
         res = train_vqc(n_qubits, n_layers, lr, train_dl, val_dl, out,
-                        label="[Sweep]")
+                        label="[Sweep]", reupload=True)
         res["regime"] = "A — sweep"
-        res = test_evaluate(res, test_dl)
+        res = test_evaluate(res, test_dl, val_dl=val_dl)
         res["notes"] = f"sweep lr={lr}"
         results.append(res)
 
-    # Summary heatmap: val AUC vs (n_qubits, n_layers)
     _plot_sweep_heatmap(results, out)
 
-    # Promote the best sweep configuration to regime_A for downstream scripts
     best_result = max(results, key=lambda r: r["best_val_auc"])
     best_ckpt_name = f"vqc_q{best_result['n_qubits']}_l{best_result['n_layers']}_lr{best_result['lr']}.pt"
     best_ckpt_src  = out / best_ckpt_name
@@ -999,22 +1032,12 @@ def _plot_sweep_heatmap(results: list, out: Path):
 
 
 def select_top_sweep_configs(results: list, top_k: int = 3, candidate_pool: int = 12) -> list:
-    """Choose a compact set of top-performing sweep configs from the best validation runs.
-
-    This returns the least-parameter variants among the top candidate pool,
-    ensuring both strong validation performance and a range from smaller to larger
-    quantum budgets.
-    """
     if not results:
         return []
-
-    # Order primarily by validation AUC, but prefer smaller circuits when tied.
     ranked = sorted(results, key=lambda r: (
         -r["best_val_auc"], -r.get("test_f1", 0.0), r["vqc_params"], r["n_qubits"], r["n_layers"]
     ))
     pool = ranked[:candidate_pool]
-
-    # Deduplicate by circuit budget so we compare unique parameter-sized variants.
     unique = []
     seen = set()
     for r in pool:
@@ -1028,7 +1051,6 @@ def select_top_sweep_configs(results: list, top_k: int = 3, candidate_pool: int 
         r["vqc_params"], -r["best_val_auc"], -r.get("test_f1", 0.0), r["n_qubits"], r["n_layers"]
     ))[:top_k]
 
-    # Present from smallest to largest parameter budget.
     return sorted(selected, key=lambda r: (
         r["vqc_params"], -r["best_val_auc"], -r.get("test_f1", 0.0), r["n_qubits"], r["n_layers"]
     ))
@@ -1039,11 +1061,6 @@ def select_top_sweep_configs(results: list, top_k: int = 3, candidate_pool: int 
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_noise_robustness(best_regime_A_result: dict) -> list:
-    """
-    Take the best Regime A config, retrain once on clean data, then evaluate
-    on test sets with increasing Gaussian noise injected into the PCA features.
-    Also runs the same noise levels on classical baseline predictions as proxy.
-    """
     print("\n" + "═"*70)
     print("  NOISE ROBUSTNESS EVALUATION")
     print("═"*70)
@@ -1055,14 +1072,13 @@ def run_noise_robustness(best_regime_A_result: dict) -> list:
     n_layers = best_regime_A_result["n_layers"]
     lr       = best_regime_A_result["lr"]
 
-    # Train once on clean data
     X_train, y_train, X_val, y_val, _, _, _ = load_split(n_qubits, noise_sigma=0.0)
     train_dl, val_dl, _ = make_loaders(
-        X_train, y_train, X_val, y_val, X_val, y_val,  # test_dl unused here
+        X_train, y_train, X_val, y_val, X_val, y_val,
         TRAIN_CFG["batch_size"]
     )
     clean_res = train_vqc(n_qubits, n_layers, lr, train_dl, val_dl,
-                          out, label="[Noise baseline — clean train]")
+                          out, label="[Noise baseline — clean train]", reupload=True)
     model = clean_res["model_ref"]
     model.load_state_dict(clean_res["best_state"])
 
@@ -1076,19 +1092,20 @@ def run_noise_robustness(best_regime_A_result: dict) -> list:
             ),
             batch_size=TRAIN_CFG["batch_size"], shuffle=False
         )
-        _, ts_acc, ts_f1, ts_auc, ts_aupr, _, _, _ = eval_epoch(model, test_dl_n, nn.BCELoss())
-        print(f"  σ={sigma:.2f}: AUC={ts_auc:.4f}  AUPR={ts_aupr:.4f}  F1={ts_f1:.4f}  Acc={ts_acc:.4f}")
+        _, ts_acc, ts_f1, ts_auc, ts_aupr, _, _, _, ts_f1_opt, tau_n, _, _ = eval_epoch(model, test_dl_n, nn.BCELoss())
+        print(f"  σ={sigma:.2f}: AUC={ts_auc:.4f}  AUPR={ts_aupr:.4f}  F1={ts_f1:.4f}  F1(τ*)={ts_f1_opt:.4f}")
         noise_results.append({
             "noise_sigma": sigma,
             "test_auc_roc": round(ts_auc, 4),
             "test_aupr": round(ts_aupr, 4),
             "test_f1": round(ts_f1, 4),
+            "test_f1_opt": round(ts_f1_opt, 4),
+            "opt_threshold": round(tau_n, 4),
             "test_accuracy": round(ts_acc, 4),
             "n_qubits": n_qubits,
             "n_layers": n_layers,
         })
 
-    # Plot degradation curve
     df_noise = pd.DataFrame(noise_results)
     fig, ax  = plt.subplots(figsize=(7, 4))
     ax.plot(df_noise["noise_sigma"], df_noise["test_auc_roc"],
@@ -1109,7 +1126,245 @@ def run_noise_robustness(best_regime_A_result: dict) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 10. MAIN
+# 10. RE-UPLOADING ABLATION, FINALIST EXPORT & REPEATED CV
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_reuploading_ablation(finalist_configs: list) -> list:
+    """
+    Tier 1 Item 6: Ablate data re-uploading on the finalist configurations.
+    """
+    print("\n" + "═"*70)
+    print("  DATA RE-UPLOADING ABLATION (Finalist Configurations)")
+    print("═"*70)
+    out = OUT_DIR / "reupload_ablation"
+    out.mkdir(parents=True, exist_ok=True)
+    results = []
+    
+    for cfg in finalist_configs:
+        nq = cfg["n_qubits"]
+        nl = cfg["n_layers"]
+        lr = cfg.get("lr", 0.01)
+        
+        X_train, y_train, X_val, y_val, X_test, y_test, _ = load_split(nq)
+        train_dl, val_dl, test_dl = make_loaders(
+            X_train, y_train, X_val, y_val, X_test, y_test,
+            TRAIN_CFG["batch_size"]
+        )
+        res_no = train_vqc(nq, nl, lr, train_dl, val_dl, out,
+                           label="[No Re-uploading]", reupload=False)
+        res_no["regime"] = f"A — ablation (no reupload, q={nq}, l={nl})"
+        res_no = test_evaluate(res_no, test_dl, val_dl=val_dl)
+        res_no["notes"] = "Data encoded once at layer 0"
+        results.append(res_no)
+        print(f"    No Re-upload (q={nq}, l={nl}): Val AUC={res_no['best_val_auc']:.4f} | Test AUC={res_no['test_auc_roc']:.4f} | Test F1(τ*)={res_no['test_f1_opt']:.4f}")
+        
+    return results
+
+
+def export_finalist_configs(regime_A_results: list, regime_B_results: list, sweep_results: list) -> list:
+    """
+    Tier 1 Item 2 Stage A: Select top finalist configurations and export finalist_configs.json.
+    """
+    candidates_A = sorted(regime_A_results + [r for r in sweep_results if r.get("regime", "").startswith("A")],
+                          key=lambda r: (-r["best_val_auc"], r["vqc_params"], r["n_qubits"], r["n_layers"]))
+    best_A1 = candidates_A[0] if candidates_A else None
+    
+    best_A2 = None
+    if best_A1:
+        for r in candidates_A[1:]:
+            if (r["n_qubits"], r["n_layers"]) != (best_A1["n_qubits"], best_A1["n_layers"]):
+                best_A2 = r
+                break
+        if best_A2 is None and len(candidates_A) > 1:
+            best_A2 = candidates_A[1]
+
+    best_B = max(regime_B_results, key=lambda r: r["best_val_auc"]) if regime_B_results else None
+
+    finalists = []
+    if best_A1:
+        finalists.append({
+            "name": f"HQCNN_A_q{best_A1['n_qubits']}_l{best_A1['n_layers']}",
+            "regime": "A",
+            "n_qubits": int(best_A1["n_qubits"]),
+            "n_layers": int(best_A1["n_layers"]),
+            "lr": float(best_A1["lr"]),
+            "val_auc": float(best_A1["best_val_auc"]),
+            "test_auc": float(best_A1.get("test_auc_roc", 0.0)),
+            "vqc_params": int(best_A1["vqc_params"]),
+            "rank": "Regime A Primary Finalist",
+        })
+    if best_A2:
+        finalists.append({
+            "name": f"HQCNN_A_q{best_A2['n_qubits']}_l{best_A2['n_layers']}",
+            "regime": "A",
+            "n_qubits": int(best_A2["n_qubits"]),
+            "n_layers": int(best_A2["n_layers"]),
+            "lr": float(best_A2["lr"]),
+            "val_auc": float(best_A2["best_val_auc"]),
+            "test_auc": float(best_A2.get("test_auc_roc", 0.0)),
+            "vqc_params": int(best_A2["vqc_params"]),
+            "rank": "Regime A Secondary Finalist",
+        })
+    if best_B:
+        finalists.append({
+            "name": f"HQCNN_B_q{best_B['n_qubits']}_l{best_B['n_layers']}",
+            "regime": "B",
+            "n_qubits": int(best_B["n_qubits"]),
+            "n_layers": int(best_B["n_layers"]),
+            "lr": float(best_B["lr"]),
+            "val_auc": float(best_B["best_val_auc"]),
+            "test_auc": float(best_B.get("test_auc_roc", 0.0)),
+            "vqc_params": int(best_B["vqc_params"]),
+            "rank": "Regime B Primary Finalist",
+        })
+
+    finalist_path = OUT_DIR / "finalist_configs.json"
+    with open(finalist_path, "w") as f:
+        json.dump(finalists, f, indent=2)
+    print(f"\n  ✓ Exported finalist configurations to: {finalist_path}")
+    return finalists
+
+
+def run_repeated_cv(finalist_configs: list, n_splits: int = 5, n_repeats: int = 3) -> dict:
+    """
+    Tier 1 Items 1 & 2 Stages B & C: Repeated Stratified CV for controls and finalist VQCs.
+    """
+    print("\n" + "═"*70)
+    print(f"  CROSS-VALIDATION EVALUATION ({n_splits}-fold × {n_repeats}-repeat = {n_splits*n_repeats} folds)")
+    print("═"*70)
+    cv_dir = OUT_DIR / "cv_outputs"
+    cv_dir.mkdir(parents=True, exist_ok=True)
+    
+    y_all = np.concatenate([
+        np.load(FEAT_DIR / "labels_train.npy"),
+        np.load(FEAT_DIR / "labels_val.npy"),
+        np.load(FEAT_DIR / "labels_test.npy"),
+    ])
+    
+    rskf = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=42)
+    cv_results = {}
+
+    # Stage B: MicroMLP controls
+    for dim in [4, 6]:
+        f_tr = np.load(FEAT_DIR / f"features_train_pca{dim}.npy")
+        f_va = np.load(FEAT_DIR / f"features_val_pca{dim}.npy")
+        f_te = np.load(FEAT_DIR / f"features_test_pca{dim}.npy")
+        X_all = np.vstack([f_tr, f_va, f_te])
+        
+        fold_aucs, fold_auprs, fold_f1s = [], [], []
+        for fold, (tr_idx, te_idx) in enumerate(rskf.split(X_all, y_all)):
+            X_tr, y_tr = X_all[tr_idx], y_all[tr_idx]
+            X_te, y_te = X_all[te_idx], y_all[te_idx]
+            
+            sc = MinMaxScaler(feature_range=(0, 1)).fit(X_tr)
+            X_tr_s = sc.transform(X_tr)
+            X_te_s = sc.transform(X_te)
+            
+            mlp = ClassicalMicroMLP(dim, hidden_dim=2)
+            opt = optim.Adam(mlp.parameters(), lr=0.01)
+            crit = nn.BCELoss()
+            ds = TensorDataset(torch.tensor(X_tr_s, dtype=torch.float32), torch.tensor(y_tr, dtype=torch.float32))
+            loader = DataLoader(ds, batch_size=16, shuffle=True)
+            mlp.train()
+            for _ in range(15):
+                for X_b, y_b in loader:
+                    opt.zero_grad()
+                    loss = crit(mlp(X_b), y_b)
+                    loss.backward()
+                    opt.step()
+            mlp.eval()
+            with torch.no_grad():
+                probs = mlp(torch.tensor(X_te_s, dtype=torch.float32)).numpy()
+            
+            fold_auc = roc_auc_score(y_te, probs) if len(set(y_te)) > 1 else 0.0
+            fold_aupr = average_precision_score(y_te, probs) if len(set(y_te)) > 1 else 0.0
+            tau = find_optimal_threshold_youden(y_te, probs)
+            fold_f1 = f1_score(y_te, (probs > tau).astype(int), zero_division=0)
+            
+            fold_aucs.append(fold_auc)
+            fold_auprs.append(fold_aupr)
+            fold_f1s.append(fold_f1)
+            
+        lbl = f"Micro-MLP (dim={dim})"
+        cv_results[lbl] = {
+            "model": lbl,
+            "auc_mean": round(float(np.mean(fold_aucs)), 4),
+            "auc_std": round(float(np.std(fold_aucs)), 4),
+            "aupr_mean": round(float(np.mean(fold_auprs)), 4),
+            "aupr_std": round(float(np.std(fold_auprs)), 4),
+            "f1_mean": round(float(np.mean(fold_f1s)), 4),
+            "f1_std": round(float(np.std(fold_f1s)), 4),
+            "fold_aucs": [round(x, 4) for x in fold_aucs],
+        }
+        print(f"  CV [Stage B] {lbl:25s} | AUC: {np.mean(fold_aucs):.4f} ± {np.std(fold_aucs):.4f} | PR-AUC: {np.mean(fold_auprs):.4f} ± {np.std(fold_auprs):.4f}")
+
+    # Stage C: Finalist VQCs
+    for cfg in finalist_configs[:2]:
+        nq = cfg["n_qubits"]
+        nl = cfg["n_layers"]
+        lr = cfg.get("lr", 0.01)
+        name = cfg.get("name", f"HQCNN_q{nq}_l{nl}")
+        
+        f_tr = np.load(FEAT_DIR / f"features_train_pca{nq}.npy")
+        f_va = np.load(FEAT_DIR / f"features_val_pca{nq}.npy")
+        f_te = np.load(FEAT_DIR / f"features_test_pca{nq}.npy")
+        X_all = np.vstack([f_tr, f_va, f_te])
+        
+        fold_aucs, fold_auprs, fold_f1s = [], [], []
+        for fold, (tr_idx, te_idx) in enumerate(rskf.split(X_all, y_all)):
+            X_tr, y_tr = X_all[tr_idx], y_all[tr_idx]
+            X_te, y_te = X_all[te_idx], y_all[te_idx]
+            
+            sc = MinMaxScaler(feature_range=(0, 1)).fit(X_tr)
+            X_tr_s = sc.transform(X_tr)
+            X_te_s = sc.transform(X_te)
+            
+            vqc = HQCNNClassifier(nq, nl)
+            opt = optim.Adam(vqc.parameters(), lr=lr)
+            crit = nn.BCELoss()
+            ds = TensorDataset(torch.tensor(X_tr_s, dtype=torch.float32), torch.tensor(y_tr, dtype=torch.float32))
+            loader = DataLoader(ds, batch_size=32, shuffle=True)
+            vqc.train()
+            for _ in range(12):
+                for X_b, y_b in loader:
+                    opt.zero_grad()
+                    loss = crit(vqc(X_b), y_b)
+                    loss.backward()
+                    opt.step()
+            vqc.eval()
+            with torch.no_grad():
+                probs = vqc(torch.tensor(X_te_s, dtype=torch.float32)).numpy()
+                
+            fold_auc = roc_auc_score(y_te, probs) if len(set(y_te)) > 1 else 0.0
+            fold_aupr = average_precision_score(y_te, probs) if len(set(y_te)) > 1 else 0.0
+            tau = find_optimal_threshold_youden(y_te, probs)
+            fold_f1 = f1_score(y_te, (probs > tau).astype(int), zero_division=0)
+            
+            fold_aucs.append(fold_auc)
+            fold_auprs.append(fold_aupr)
+            fold_f1s.append(fold_f1)
+            
+        cv_results[name] = {
+            "model": name,
+            "auc_mean": round(float(np.mean(fold_aucs)), 4),
+            "auc_std": round(float(np.std(fold_aucs)), 4),
+            "aupr_mean": round(float(np.mean(fold_auprs)), 4),
+            "aupr_std": round(float(np.std(fold_auprs)), 4),
+            "f1_mean": round(float(np.mean(fold_f1s)), 4),
+            "f1_std": round(float(np.std(fold_f1s)), 4),
+            "fold_aucs": [round(x, 4) for x in fold_aucs],
+        }
+        print(f"  CV [Stage C] {name:25s} | AUC: {np.mean(fold_aucs):.4f} ± {np.std(fold_aucs):.4f} | PR-AUC: {np.mean(fold_auprs):.4f} ± {np.std(fold_auprs):.4f}")
+
+    with open(OUT_DIR / "cv_results.json", "w") as f:
+        json.dump(cv_results, f, indent=2)
+    pd.DataFrame(list(cv_results.values())).to_csv(OUT_DIR / "cv_summary.csv", index=False)
+    print(f"  ✓ Saved CV summary: {OUT_DIR / 'cv_summary.csv'}")
+    return cv_results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 11. MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
@@ -1124,7 +1379,6 @@ def main():
         return
 
     all_results = []
-    
     seed_everything(42)
 
     # ── 3_: Regime A ────────────────────────────────────────────────────
@@ -1136,10 +1390,8 @@ def main():
     all_results.extend(regime_B_results)
 
     # ── 4b_: Noise robustness ────────────────────────────────────────────
-    # Use best Regime A result (highest val AUC)
     best_A = max(regime_A_results, key=lambda r: r["best_val_auc"])
     noise_results = run_noise_robustness(best_A)
-    # Add noise rows to ablation (non-zero sigma only)
     for nr in noise_results:
         if nr["noise_sigma"] > 0:
             nr["regime"]  = "A — noise robustness"
@@ -1154,6 +1406,13 @@ def main():
         r["notes"] = f"sweep lr={r['lr']}"
     all_results.extend(sweep_results)
 
+    # ── Export finalist configurations (Tier 1 Item 2 Stage A) ───────────
+    finalists = export_finalist_configs(regime_A_results, regime_B_results, sweep_results)
+
+    # ── Data re-uploading ablation (Tier 1 Item 6) ──────────────────────
+    reupload_ablation_results = run_reuploading_ablation(finalists[:2])
+    all_results.extend(reupload_ablation_results)
+
     # ── Classical control baselines ──────────────────────────────────────────
     classical_results = run_classical_control_configs(n_features=4)
     all_results.extend(classical_results)
@@ -1164,6 +1423,9 @@ def main():
         print("\n  Running parameter-matched classical MLP baselines for top sweep configs...")
         matched_results = run_parameter_matched_mlp_baselines(top_vqc_runs)
         all_results.extend(matched_results)
+
+    # ── Repeated Stratified CV scheme (Tier 1 Items 1 & 2 Stages B & C) ─
+    run_repeated_cv(finalists)
 
     # ── Build & save ablation table ──────────────────────────────────────────
     print("\n" + "═"*70)
@@ -1182,7 +1444,7 @@ def main():
 
     CACHE.mark_done("vqc")
     print(f"\n✓ 3–5 COMPLETE. All outputs in: {OUT_DIR}")
-    print("  Next step → 6_qfl.py (Quantum Federated Learning)")
+    print("  Next step → 6_7_uq.py (Uncertainty Quantification)")
 
 
 if __name__ == "__main__":

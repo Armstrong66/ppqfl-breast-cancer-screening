@@ -61,8 +61,9 @@ from torchvision.models import MobileNet_V2_Weights
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.metrics import roc_auc_score, accuracy_score, average_precision_score
 
 from pipeline_utils import seed_everything
 
@@ -146,7 +147,7 @@ BASE          = PROJECT_ROOT / "outputs"
 
 # ── Match this to BACKBONE in _2a_baseline.py ──────────────────────────────
 BACKBONE         = "mobilenetv2"   # "mobilenetv2" | "resnet50" | "efficientnet_b0"
-BEST_CHECKPOINT  = BASE / "baseline_outputs/{BACKBONE}_best.pt"
+BEST_CHECKPOINT  = BASE / "baseline_outputs" / f"{BACKBONE}_best.pt"
 SPLIT_INDEX_FILE = BASE / "eda_outputs/mendeley_split_indices.json"
 
 # ── Output ───────────────────────────────────────────────────────────────────
@@ -504,11 +505,9 @@ def validate_pca_with_linear_probe(features_train_pca: dict, labels_train: np.nd
                                    features_val_pca: dict, labels_val: np.ndarray):
     """
     Quick sanity check: fit a logistic regression on PCA features and
-    evaluate on val set. If the AUC stays close to the MobileNetV2 baseline,
-    the PCA features are good enough for the VQC to work with.
-
-    This is NOT the quantum model — just a fast linear check that class
-    structure is preserved in the compressed feature space.
+    evaluate on val set.
+    Reports both ROC-AUC (primary, threshold-independent) and PR-AUC/average precision
+    (secondary, sensitive to minority malignant class) to verify class separability.
     """
     print("\n  ── Linear Probe Validation (PCA features → Logistic Regression) ──")
     results = {}
@@ -519,11 +518,68 @@ def validate_pca_with_linear_probe(features_train_pca: dict, labels_train: np.nd
         lr.fit(X_tr, labels_train)
         val_probs = lr.predict_proba(X_vl)[:, 1]
         val_preds = lr.predict(X_vl)
-        auc = roc_auc_score(labels_val, val_probs) if len(set(labels_val)) > 1 else 0.0
-        acc = accuracy_score(labels_val, val_preds)
-        print(f"    PCA n={n}: Val AUC = {auc:.4f}  Val Acc = {acc:.4f}")
-        results[n] = {"val_auc": round(auc, 4), "val_acc": round(acc, 4)}
+        auc  = roc_auc_score(labels_val, val_probs) if len(set(labels_val)) > 1 else 0.0
+        aupr = average_precision_score(labels_val, val_probs) if len(set(labels_val)) > 1 else 0.0
+        acc  = accuracy_score(labels_val, val_preds)
+        print(f"    PCA n={n}: Val AUC = {auc:.4f}  Val PR-AUC = {aupr:.4f}  Val Acc = {acc:.4f}")
+        results[n] = {"val_auc": round(auc, 4), "val_aupr": round(aupr, 4), "val_acc": round(acc, 4)}
     return results
+
+
+def validate_compression_ablation(X_train_raw: np.ndarray, y_train: np.ndarray,
+                                  X_val_raw: np.ndarray, y_val: np.ndarray) -> dict:
+    """
+    Tier 2 Item 11: Feature compression ablation comparing PCA vs. LDA vs. UMAP.
+    Linear probe evaluation on validation set across matched dimension targets.
+    """
+    print("\n  ── Feature Compression Ablation: PCA vs. LDA vs. UMAP (Linear Probe) ──")
+    ablation_results = {}
+
+    # 1. Standard Scaler on raw features
+    scaler_raw = StandardScaler().fit(X_train_raw)
+    X_tr_sc = scaler_raw.transform(X_train_raw)
+    X_vl_sc = scaler_raw.transform(X_val_raw)
+
+    # 2. PCA at matched dimensions
+    for n in PCA_N_COMPONENTS:
+        pca = PCA(n_components=n, random_state=42).fit(X_tr_sc)
+        X_tr_p = pca.transform(X_tr_sc)
+        X_vl_p = pca.transform(X_vl_sc)
+        lr = LogisticRegression(max_iter=1000, random_state=42, C=1.0).fit(X_tr_p, y_train)
+        probs = lr.predict_proba(X_vl_p)[:, 1]
+        auc = roc_auc_score(y_val, probs) if len(set(y_val)) > 1 else 0.0
+        aupr = average_precision_score(y_val, probs) if len(set(y_val)) > 1 else 0.0
+        ablation_results[f"PCA_n{n}"] = {"method": "PCA", "dim": n, "val_auc": round(auc, 4), "val_aupr": round(aupr, 4)}
+        print(f"    PCA  (n={n}): Val AUC = {auc:.4f} | Val PR-AUC = {aupr:.4f}")
+
+    # 3. LDA (yields 1 discriminant direction for binary classification)
+    lda = LinearDiscriminantAnalysis().fit(X_tr_sc, y_train)
+    X_tr_lda = lda.transform(X_tr_sc)
+    X_vl_lda = lda.transform(X_vl_sc)
+    lr_lda = LogisticRegression(max_iter=1000, random_state=42).fit(X_tr_lda, y_train)
+    probs_lda = lr_lda.predict_proba(X_vl_lda)[:, 1]
+    auc_lda = roc_auc_score(y_val, probs_lda) if len(set(y_val)) > 1 else 0.0
+    aupr_lda = average_precision_score(y_val, probs_lda) if len(set(y_val)) > 1 else 0.0
+    ablation_results["LDA_1D"] = {"method": "LDA", "dim": 1, "val_auc": round(auc_lda, 4), "val_aupr": round(aupr_lda, 4)}
+    print(f"    LDA  (dim=1): Val AUC = {auc_lda:.4f} | Val PR-AUC = {aupr_lda:.4f} (Supervised Reference)")
+
+    # 4. UMAP (if installed)
+    try:
+        import umap
+        for n in PCA_N_COMPONENTS:
+            reducer = umap.UMAP(n_components=n, random_state=42, n_neighbors=15, min_dist=0.1)
+            X_tr_u = reducer.fit_transform(X_tr_sc)
+            X_vl_u = reducer.transform(X_vl_sc)
+            lr_u = LogisticRegression(max_iter=1000, random_state=42).fit(X_tr_u, y_train)
+            probs_u = lr_u.predict_proba(X_vl_u)[:, 1]
+            auc_u = roc_auc_score(y_val, probs_u) if len(set(y_val)) > 1 else 0.0
+            aupr_u = average_precision_score(y_val, probs_u) if len(set(y_val)) > 1 else 0.0
+            ablation_results[f"UMAP_n{n}"] = {"method": "UMAP", "dim": n, "val_auc": round(auc_u, 4), "val_aupr": round(aupr_u, 4)}
+            print(f"    UMAP (n={n}): Val AUC = {auc_u:.4f} | Val PR-AUC = {aupr_u:.4f}")
+    except ImportError:
+        print("    [INFO] umap-learn not installed; skipping UMAP linear probe comparison.")
+
+    return ablation_results
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -666,11 +722,18 @@ def main():
         pca_features[4]["train"]
     )
 
+    # ── Compression ablation (PCA vs LDA vs UMAP) ───────────────────────────
+    compression_ablation = validate_compression_ablation(
+        raw_features["train"], raw_labels["train"],
+        raw_features["val"],   raw_labels["val"]
+    )
+
     # ── Save report ──────────────────────────────────────────────────────────
     report = {
-        "pca_variants":       pca_report,
-        "linear_probe":       probe_results,
-        "feature_shape_raw":  list(raw_features["train"].shape),
+        "pca_variants":         pca_report,
+        "linear_probe":         probe_results,
+        "compression_ablation": compression_ablation,
+        "feature_shape_raw":    list(raw_features["train"].shape),
         "splits": {
             "train": int(len(raw_labels["train"])),
             "val":   int(len(raw_labels["val"])),

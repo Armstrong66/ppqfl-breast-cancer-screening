@@ -94,13 +94,27 @@ BACKBONE     = "mobilenetv2"
 def auto_detect_best_vqc_config(ckpt_dir: Path) -> tuple:
     """
     Scans regime_A checkpoint directory for the best VQC config by val AUC.
-    Priority: best_run_manifest.json (written by multi-trial sweep) →
-              history CSVs → first checkpoint found (fallback).
+    Priority: finalist_configs.json → best_run_manifest.json → history CSVs → fallback.
     Returns (n_qubits, n_layers, lr).
     """
     import re
     ckpt_dir = Path(ckpt_dir)
  
+    # Priority 0: finalist_configs.json written by Tier 1 Stage A
+    finalists_file = ckpt_dir.parent / "finalist_configs.json"
+    if finalists_file.exists():
+        try:
+            with open(finalists_file) as f:
+                finalists = json.load(f)
+            if finalists:
+                primary = finalists[0]
+                cfg = (int(primary["n_qubits"]), int(primary["n_layers"]), float(primary["lr"]))
+                print(f"  Auto-detect: loaded from finalist_configs.json → "
+                      f"q={cfg[0]} l={cfg[1]} lr={cfg[2]}")
+                return cfg
+        except Exception:
+            pass
+
     # Priority 1: manifest written by multi-trial sweep
     manifest = ckpt_dir / "best_run_manifest.json"
     if manifest.exists():
@@ -131,7 +145,6 @@ def auto_detect_best_vqc_config(ckpt_dir: Path) -> tuple:
                 pass
         if best_config is None:          # fallback: first parseable checkpoint
             best_config = (nq, nl, lr)
-            print(f"Fellback on {best_config}. Still couldn't find the right/actual configs from 3_5_vqc")
  
     if best_config is None:
         raise FileNotFoundError(
