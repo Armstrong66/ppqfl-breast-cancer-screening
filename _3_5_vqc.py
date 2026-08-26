@@ -76,6 +76,9 @@ BASE          = PROJECT_ROOT / "outputs"
 FEAT_DIR      = BASE / "feature_outputs"
 OUT_DIR       = BASE / "vqc_outputs"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+for d in ["regime_A", "regime_B", "noise", "sweep", "reupload_ablation", "cv_outputs"]:
+    (OUT_DIR / d).mkdir(parents=True, exist_ok=True)
+
 BASELINE_JSON = BASE / "baseline_outputs/baseline_results.json"
 
 # ── VQC hyperparameter grid (5 sweep) ───────────────────────────────────
@@ -85,6 +88,7 @@ SWEEP_CFG = {
     "n_layers":    [1, 2, 3],       # VQC depth (ansatz repetitions)
     "encoding":    ["angle"],       # "angle" only for now; extend later
     "lr":          [0.01, 0.005],
+    "reupload":    [True, False],   # compare reupload vs no-reupload across the sweep
 }
 
 # ── Training config (shared across regimes) ──────────────────────────────────
@@ -745,6 +749,7 @@ def run_regime_A() -> list:
     print("  REGIME A — Frozen Classical + Train VQC")
     print("═"*70)
     out = OUT_DIR / "regime_A"
+    out.mkdir(parents=True, exist_ok=True)
     results = []
     seed_everything(42)
 
@@ -868,6 +873,7 @@ def run_regime_B() -> list:
                 print(f"      Early stopping at epoch {epoch}.")
                 break
 
+        out.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(history).to_csv(
             out / f"regimeB_q{n_qubits}_l{n_layers}_history.csv", index=False, encoding="utf-8-sig"
         )
@@ -935,10 +941,10 @@ def run_regime_B() -> list:
 
 def run_sweep() -> list:
     """
-    Grid sweep over SWEEP_CFG. Runs Regime A for each combination.
+    Grid sweep over SWEEP_CFG. Runs Regime A for each combination, including reuploading vs no-reuploading.
     """
     print("\n" + "═"*70)
-    print("  HYPERPARAMETER SWEEP (Regime A)")
+    print("  HYPERPARAMETER SWEEP (Regime A: Qubits × Layers × LR × Re-uploading)")
     print("═"*70)
     out = OUT_DIR / "sweep"
     out.mkdir(parents=True, exist_ok=True)
@@ -948,31 +954,36 @@ def run_sweep() -> list:
         SWEEP_CFG["n_qubits"],
         SWEEP_CFG["n_layers"],
         SWEEP_CFG["lr"],
+        SWEEP_CFG.get("reupload", [True, False]),
     ))
-    print(f"  Total configurations: {len(grid)}")
+    print(f"  Total configurations in sweep grid: {len(grid)}")
 
-    for n_qubits, n_layers, lr in grid:
+    for n_qubits, n_layers, lr, reup in grid:
         X_train, y_train, X_val, y_val, X_test, y_test, _ = load_split(n_qubits)
         train_dl, val_dl, test_dl = make_loaders(
             X_train, y_train, X_val, y_val, X_test, y_test,
             TRAIN_CFG["batch_size"]
         )
         res = train_vqc(n_qubits, n_layers, lr, train_dl, val_dl, out,
-                        label="[Sweep]", reupload=True)
-        res["regime"] = "A — sweep"
+                        label=f"[Sweep {'reupload' if reup else 'no-reupload'}]", reupload=reup)
+        res["regime"] = f"A — sweep ({'reupload' if reup else 'no-reupload'})"
         res = test_evaluate(res, test_dl, val_dl=val_dl)
-        res["notes"] = f"sweep lr={lr}"
+        res["notes"] = f"sweep lr={lr} reup={reup}"
         results.append(res)
 
     _plot_sweep_heatmap(results, out)
 
     best_result = max(results, key=lambda r: r["best_val_auc"])
-    best_ckpt_name = f"vqc_q{best_result['n_qubits']}_l{best_result['n_layers']}_lr{best_result['lr']}.pt"
+    reup_suffix = "" if best_result.get("reupload", True) else "_noreupload"
+    best_ckpt_name = f"vqc_q{best_result['n_qubits']}_l{best_result['n_layers']}_lr{best_result['lr']}{reup_suffix}.pt"
     best_ckpt_src  = out / best_ckpt_name
     regime_A_dir   = OUT_DIR / "regime_A"
     regime_A_dir.mkdir(parents=True, exist_ok=True)
     if best_ckpt_src.exists():
         shutil.copy2(best_ckpt_src, regime_A_dir / best_ckpt_name)
+        # Also copy as canonical default checkpoint
+        canonical_name = f"vqc_q{best_result['n_qubits']}_l{best_result['n_layers']}_lr{best_result['lr']}.pt"
+        shutil.copy2(best_ckpt_src, regime_A_dir / canonical_name)
         print(f"  Promoted best sweep checkpoint to regime_A: {best_ckpt_name}")
     else:
         print(f"  [WARN] Best sweep checkpoint not found: {best_ckpt_src}")
@@ -983,6 +994,7 @@ def run_sweep() -> list:
             "n_qubits": int(best_result["n_qubits"]),
             "n_layers": int(best_result["n_layers"]),
             "lr": float(best_result["lr"]),
+            "reupload": bool(best_result.get("reupload", True)),
             "val_auc": float(best_result["best_val_auc"]),
             "regime": "A — sweep",
         }, f, indent=2)
@@ -991,7 +1003,7 @@ def run_sweep() -> list:
     top_runs = select_top_sweep_configs(results, top_k=3)
     print("  Selected top-3 sweep configs by compact budget and validation performance:")
     for r in top_runs:
-        print(f"    q={r['n_qubits']} l={r['n_layers']} params={r['vqc_params']} "
+        print(f"    q={r['n_qubits']} l={r['n_layers']} reup={r.get('reupload', True)} params={r['vqc_params']} "
               f"val_auc={r['best_val_auc']:.4f} test_aupr={r.get('test_aupr', 0.0):.4f}")
     top_manifest = regime_A_dir / "top_sweep_manifest.json"
     with open(top_manifest, "w") as f:
@@ -1000,6 +1012,7 @@ def run_sweep() -> list:
                 "n_qubits": int(r["n_qubits"]),
                 "n_layers": int(r["n_layers"]),
                 "lr": float(r["lr"]),
+                "reupload": bool(r.get("reupload", True)),
                 "val_auc": float(r["best_val_auc"]),
                 "test_auc_roc": float(r["test_auc_roc"]),
                 "test_aupr": float(r.get("test_aupr", 0.0)),
@@ -1015,19 +1028,35 @@ def run_sweep() -> list:
 
 def _plot_sweep_heatmap(results: list, out: Path):
     records = [{"n_qubits": r["n_qubits"], "n_layers": r["n_layers"],
-                "lr": r["lr"], "val_auc": r["best_val_auc"]} for r in results]
+                "lr": r["lr"], "reupload": r.get("reupload", True), "val_auc": r["best_val_auc"]} for r in results]
     df = pd.DataFrame(records)
-    best_lr = df.groupby(["n_qubits","n_layers"])["val_auc"].max().reset_index()
-    pivot   = best_lr.pivot(index="n_qubits", columns="n_layers", values="val_auc")
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    sns.heatmap(pivot, annot=True, fmt=".4f", cmap="YlOrRd", ax=ax,
-                linewidths=0.5, cbar_kws={"label": "Best Val AUC"})
-    ax.set_title("Hyperparameter Sweep — Val AUC\n(best LR per config)")
-    ax.set_xlabel("n_layers"); ax.set_ylabel("n_qubits")
-    plt.tight_layout()
-    plt.savefig(out / "sweep_heatmap.png", dpi=150, bbox_inches="tight")
-    plt.close()
+    out.mkdir(parents=True, exist_ok=True)
+    
+    if df["reupload"].nunique() > 1:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+        for idx, (reup_val, title) in enumerate([(True, "Data Re-uploading (Every Layer)"), (False, "No Re-uploading (Layer 0 Only)")]):
+            sub_df = df[df["reupload"] == reup_val]
+            if not sub_df.empty:
+                best_lr = sub_df.groupby(["n_qubits","n_layers"])["val_auc"].max().reset_index()
+                pivot   = best_lr.pivot(index="n_qubits", columns="n_layers", values="val_auc")
+                sns.heatmap(pivot, annot=True, fmt=".4f", cmap="YlOrRd", ax=axes[idx],
+                            linewidths=0.5, cbar_kws={"label": "Best Val AUC"}, vmin=0.5, vmax=1.0)
+                axes[idx].set_title(f"{title}\n(Val AUC)")
+                axes[idx].set_xlabel("n_layers"); axes[idx].set_ylabel("n_qubits")
+        plt.tight_layout()
+        plt.savefig(out / "sweep_heatmap.png", dpi=150, bbox_inches="tight")
+        plt.close()
+    else:
+        best_lr = df.groupby(["n_qubits","n_layers"])["val_auc"].max().reset_index()
+        pivot   = best_lr.pivot(index="n_qubits", columns="n_layers", values="val_auc")
+        fig, ax = plt.subplots(figsize=(8, 5))
+        sns.heatmap(pivot, annot=True, fmt=".4f", cmap="YlOrRd", ax=ax,
+                    linewidths=0.5, cbar_kws={"label": "Best Val AUC"})
+        ax.set_title("Hyperparameter Sweep — Val AUC\n(best LR per config)")
+        ax.set_xlabel("n_layers"); ax.set_ylabel("n_qubits")
+        plt.tight_layout()
+        plt.savefig(out / "sweep_heatmap.png", dpi=150, bbox_inches="tight")
+        plt.close()
     print(f"  Sweep heatmap saved: {out / 'sweep_heatmap.png'}")
 
 
