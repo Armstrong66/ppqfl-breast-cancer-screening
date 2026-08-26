@@ -563,21 +563,33 @@ def validate_compression_ablation(X_train_raw: np.ndarray, y_train: np.ndarray,
     ablation_results["LDA_1D"] = {"method": "LDA", "dim": 1, "val_auc": round(auc_lda, 4), "val_aupr": round(aupr_lda, 4)}
     print(f"    LDA  (dim=1): Val AUC = {auc_lda:.4f} | Val PR-AUC = {aupr_lda:.4f} (Supervised Reference)")
 
-    # 4. UMAP (if installed)
+    # 4. UMAP (auto-install if missing)
     try:
         import umap
-        for n in PCA_N_COMPONENTS:
-            reducer = umap.UMAP(n_components=n, random_state=42, n_neighbors=15, min_dist=0.1)
-            X_tr_u = reducer.fit_transform(X_tr_sc)
-            X_vl_u = reducer.transform(X_vl_sc)
-            lr_u = LogisticRegression(max_iter=1000, random_state=42).fit(X_tr_u, y_train)
-            probs_u = lr_u.predict_proba(X_vl_u)[:, 1]
-            auc_u = roc_auc_score(y_val, probs_u) if len(set(y_val)) > 1 else 0.0
-            aupr_u = average_precision_score(y_val, probs_u) if len(set(y_val)) > 1 else 0.0
-            ablation_results[f"UMAP_n{n}"] = {"method": "UMAP", "dim": n, "val_auc": round(auc_u, 4), "val_aupr": round(aupr_u, 4)}
-            print(f"    UMAP (n={n}): Val AUC = {auc_u:.4f} | Val PR-AUC = {aupr_u:.4f}")
     except ImportError:
-        print("    [INFO] umap-learn not installed; skipping UMAP linear probe comparison.")
+        try:
+            import subprocess, sys
+            print("    [INFO] umap-learn not found. Auto-installing umap-learn...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "umap-learn"])
+            import umap
+        except Exception as e:
+            print(f"    [WARN] Could not auto-install umap-learn: {e}. Skipping UMAP linear probe comparison.")
+            umap = None
+
+    if 'umap' in locals() and umap is not None:
+        try:
+            for n in PCA_N_COMPONENTS:
+                reducer = umap.UMAP(n_components=n, random_state=42, n_neighbors=15, min_dist=0.1)
+                X_tr_u = reducer.fit_transform(X_tr_sc)
+                X_vl_u = reducer.transform(X_vl_sc)
+                lr_u = LogisticRegression(max_iter=1000, random_state=42).fit(X_tr_u, y_train)
+                probs_u = lr_u.predict_proba(X_vl_u)[:, 1]
+                auc_u = roc_auc_score(y_val, probs_u) if len(set(y_val)) > 1 else 0.0
+                aupr_u = average_precision_score(y_val, probs_u) if len(set(y_val)) > 1 else 0.0
+                ablation_results[f"UMAP_n{n}"] = {"method": "UMAP", "dim": n, "val_auc": round(auc_u, 4), "val_aupr": round(aupr_u, 4)}
+                print(f"    UMAP (n={n}): Val AUC = {auc_u:.4f} | Val PR-AUC = {aupr_u:.4f}")
+        except Exception as e:
+            print(f"    [WARN] UMAP calculation error: {e}")
 
     return ablation_results
 
