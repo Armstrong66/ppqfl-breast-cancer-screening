@@ -81,26 +81,43 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def auto_detect_best_vqc_config(ckpt_dir: Path) -> tuple:
+    # Priority 0: finalist_configs.json
+    finalists_file = ckpt_dir.parent / "finalist_configs.json"
+    if finalists_file.exists():
+        try:
+            with open(finalists_file) as f:
+                finalists = json.load(f)
+            if finalists:
+                primary = finalists[0]
+                return (int(primary.get("n_qubits", 4)),
+                        int(primary.get("n_layers", 2)),
+                        float(primary.get("lr", 0.01)),
+                        bool(primary.get("reupload", True)))
+        except Exception:
+            pass
+
     manifest = ckpt_dir / "best_run_manifest.json"
     if manifest.exists():
         with open(manifest) as f:
             m = json.load(f)
-        return int(m.get("n_qubits", 4)), int(m.get("n_layers", 2)), float(m.get("lr", 0.01))
+        return (int(m.get("n_qubits", 4)), int(m.get("n_layers", 2)),
+                float(m.get("lr", 0.01)), bool(m.get("reupload", True)))
 
     best_config = None
     best_auc = -1.0
     for ckpt in sorted(ckpt_dir.glob("vqc_q*_l*_lr*.pt")):
-        match = re.match(r"vqc_q(\d+)_l(\d+)_lr([\d.]+)\.pt", ckpt.name)
+        match = re.match(r"vqc_q(\d+)_l(\d+)_lr([\d.]+)(_noreupload)?\.pt", ckpt.name)
         if not match:
             continue
         nq, nl, lr = int(match.group(1)), int(match.group(2)), float(match.group(3))
-        history = ckpt_dir / f"vqc_q{nq}_l{nl}_lr{lr}_history.csv"
+        reup = not bool(match.group(4))
+        history = ckpt_dir / f"{ckpt.stem}_history.csv"
         if history.exists():
             try:
                 auc = pd.read_csv(history)["val_auc"].max()
                 if auc > best_auc:
                     best_auc = auc
-                    best_config = (nq, nl, lr)
+                    best_config = (nq, nl, lr, reup)
             except Exception:
                 continue
     if best_config is not None:
@@ -108,26 +125,25 @@ def auto_detect_best_vqc_config(ckpt_dir: Path) -> tuple:
 
     print("  [WARN] Could not auto-detect best VQC config from manifest or history. "
           "Falling back to defaults q=4, l=2, lr=0.01.")
-    return 4, 2, 0.01
+    return 4, 2, 0.01, True
 
 # ── Match to best config from _3–5 sweep (this is also need to auto_detect) ─────────────────────────────────
 BACKBONE      = "mobilenetv2"
-N_QUBITS, N_LAYERS, VQC_LR = auto_detect_best_vqc_config(VQC_DIR_A)
-BATCH_SIZE    = 32
-DEVICE        = torch.device("cpu")
+N_QUBITS, N_LAYERS, VQC_LR, VQC_REUPLOAD = auto_detect_best_vqc_config(VQC_DIR_A)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1.  VQC RECONSTRUCTION  (self-contained, no cross-file import)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_vqc(n_qubits, n_layers):
+def build_vqc(n_qubits, n_layers, reupload: bool = True):
     dev = qml.device("default.qubit", wires=n_qubits)
     @qml.qnode(dev, interface="torch", diff_method="parameter-shift")
     def circuit(inputs, weights):
         for layer in range(n_layers):
-            for i in range(n_qubits):
-                qml.RY(np.pi * inputs[i], wires=i)
+            if layer == 0 or reupload:
+                for i in range(n_qubits):
+                    qml.RY(np.pi * inputs[i], wires=i)
             for i in range(n_qubits):
                 qml.RY(weights[layer, i], wires=i)
             for i in range(n_qubits):
@@ -137,9 +153,10 @@ def build_vqc(n_qubits, n_layers):
 
 
 class VQCModel(nn.Module):
-    def __init__(self, n_qubits, n_layers):
+    def __init__(self, n_qubits, n_layers, reupload: bool = True):
         super().__init__()
-        self.vqc  = build_vqc(n_qubits, n_layers)
+        self.reupload = reupload
+        self.vqc  = build_vqc(n_qubits, n_layers, reupload=reupload)
         self.bias = nn.Parameter(torch.zeros(1))
     def forward(self, x):
         out = torch.stack([self.vqc(x[i]) for i in range(x.shape[0])])
@@ -152,28 +169,37 @@ def load_or_train_vqc(n_qubits: int, n_layers: int, lr: float = 0.01,
                       X_train_scaled: Optional[np.ndarray] = None,
                       y_train: Optional[np.ndarray] = None,
                       X_val_scaled: Optional[np.ndarray] = None,
-                      y_val: Optional[np.ndarray] = None) -> VQCModel:
+                      y_val: Optional[np.ndarray] = None,
+                      reupload: bool = True) -> VQCModel:
     """Load existing VQC checkpoint across all directories, or fit quickly with validation early-stopping."""
     seed_everything(42)
-    model = VQCModel(n_qubits, n_layers)
+    suffix = "" if reupload else "_noreupload"
 
     candidates = [
+        VQC_DIR_A / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}{suffix}.pt",
         VQC_DIR_A / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt",
+        VQC_DIR_A.parent / "sweep" / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}{suffix}.pt",
         VQC_DIR_A.parent / "sweep" / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt",
     ]
     for p in [VQC_DIR_A, VQC_DIR_A.parent / "sweep", BASE / "vqc_outputs"]:
         if p.exists():
+            candidates.extend(list(p.glob(f"vqc_q{n_qubits}_l{n_layers}_*{suffix}.pt")))
             candidates.extend(list(p.glob(f"vqc_q{n_qubits}_l{n_layers}_*.pt")))
 
     for ckpt in candidates:
         if ckpt.exists():
+            # Check if checkpoint name explicitly denotes noreupload
+            ckpt_reup = False if "_noreupload" in ckpt.name else reupload
+            model = VQCModel(n_qubits, n_layers, reupload=ckpt_reup)
             try:
                 model.load_state_dict(torch.load(ckpt, map_location="cpu"))
-                print(f"  Loaded VQC checkpoint: {ckpt.name}")
+                print(f"  Loaded VQC checkpoint: {ckpt.name} (reupload={ckpt_reup})")
                 model.eval()
                 return model
             except Exception:
                 continue
+
+    model = VQCModel(n_qubits, n_layers, reupload=reupload)
 
     if X_train_scaled is not None and y_train is not None and X_val_scaled is not None and y_val is not None:
         print(f"  [INFO] Training VQC q={n_qubits} l={n_layers} lr={lr} (no prior checkpoint found)...")

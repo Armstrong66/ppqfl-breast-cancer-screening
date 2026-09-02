@@ -95,7 +95,7 @@ def auto_detect_best_vqc_config(ckpt_dir: Path) -> tuple:
     """
     Scans regime_A checkpoint directory for the best VQC config by val AUC.
     Priority: finalist_configs.json → best_run_manifest.json → history CSVs → fallback.
-    Returns (n_qubits, n_layers, lr).
+    Returns (n_qubits, n_layers, lr, reupload).
     """
     import re
     ckpt_dir = Path(ckpt_dir)
@@ -108,10 +108,13 @@ def auto_detect_best_vqc_config(ckpt_dir: Path) -> tuple:
                 finalists = json.load(f)
             if finalists:
                 primary = finalists[0]
-                cfg = (int(primary["n_qubits"]), int(primary["n_layers"]), float(primary["lr"]))
+                cfg_q  = int(primary["n_qubits"])
+                cfg_l  = int(primary["n_layers"])
+                cfg_lr = float(primary["lr"])
+                reupload = bool(primary.get("reupload", True))
                 print(f"  Auto-detect: loaded from finalist_configs.json → "
-                      f"q={cfg[0]} l={cfg[1]} lr={cfg[2]}")
-                return cfg
+                      f"q={cfg_q} l={cfg_l} lr={cfg_lr} reupload={reupload}")
+                return cfg_q, cfg_l, cfg_lr, reupload
         except Exception:
             pass
 
@@ -120,31 +123,35 @@ def auto_detect_best_vqc_config(ckpt_dir: Path) -> tuple:
     if manifest.exists():
         with open(manifest) as f:
             m = json.load(f)
-        cfg = (int(m["n_qubits"]), int(m["n_layers"]), float(m["lr"]))
+        cfg_q  = int(m["n_qubits"])
+        cfg_l  = int(m["n_layers"])
+        cfg_lr = float(m["lr"])
+        reupload = bool(m.get("reupload", True))
         print(f"  Auto-detect: loaded from manifest → "
-              f"q={cfg[0]} l={cfg[1]} lr={cfg[2]} "
+              f"q={cfg_q} l={cfg_l} lr={cfg_lr} reupload={reupload} "
               f"(val AUC={m.get('val_auc','?')})")
-        return cfg
+        return cfg_q, cfg_l, cfg_lr, reupload
  
     # Priority 2: scan history CSVs for best val AUC
-    best_auc   = -1.0
+    best_auc    = -1.0
     best_config = None
     for ckpt_path in sorted(ckpt_dir.glob("vqc_q*.pt")):
-        match = re.search(r"vqc_q(\d+)_l(\d+)_lr([\d.]+)\.pt", ckpt_path.name)
+        match = re.search(r"vqc_q(\d+)_l(\d+)_lr([\d.]+)(_noreupload)?\.pt", ckpt_path.name)
         if not match:
             continue
-        nq, nl, lr = int(match.group(1)), int(match.group(2)), float(match.group(3))
-        history_file = ckpt_dir / f"vqc_q{nq}_l{nl}_lr{lr}_history.csv"
+        nq, nl, lr_v = int(match.group(1)), int(match.group(2)), float(match.group(3))
+        reup = not bool(match.group(4))
+        history_file = ckpt_dir / f"{ckpt_path.stem}_history.csv"
         if history_file.exists():
             try:
                 max_auc = pd.read_csv(history_file)["val_auc"].max()
                 if max_auc > best_auc:
                     best_auc    = max_auc
-                    best_config = (nq, nl, lr)
+                    best_config = (nq, nl, lr_v, reup)
             except Exception:
                 pass
         if best_config is None:          # fallback: first parseable checkpoint
-            best_config = (nq, nl, lr)
+            best_config = (nq, nl, lr_v, reup)
  
     if best_config is None:
         raise FileNotFoundError(
@@ -154,11 +161,11 @@ def auto_detect_best_vqc_config(ckpt_dir: Path) -> tuple:
  
     print(f"  Auto-detect: best config from history → "
           f"q={best_config[0]} l={best_config[1]} lr={best_config[2]} "
-          f"(val AUC={best_auc:.4f})")
+          f"reupload={best_config[3]} (val AUC={best_auc:.4f})")
     return best_config
  
 # Dynamic Assignment
-VQC_N_QUBITS, VQC_N_LAYERS, VQC_LR = auto_detect_best_vqc_config(VQC_CKPT_DIR / "regime_A")
+VQC_N_QUBITS, VQC_N_LAYERS, VQC_LR, VQC_REUPLOAD = auto_detect_best_vqc_config(VQC_CKPT_DIR / "regime_A")
 
 OUT_DIR = BASE / "uq_outputs"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -198,15 +205,19 @@ def load_test_split(n_qubits: int, noise_sigma: float = 0.0):
 # 2.  VQC RECONSTRUCTION  (mirrors 3_5_vqc.py exactly)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_vqc_deterministic(n_qubits: int, n_layers: int):
-    """Standard VQC with analytic expectation (no shots) — for point estimate."""
+def build_vqc_deterministic(n_qubits: int, n_layers: int, reupload: bool = True):
+    """Standard VQC with analytic expectation (no shots) — for point estimate.
+    Circuit exactly mirrors 3_5_vqc.py: reupload=True re-embeds features every layer,
+    reupload=False embeds only at layer 0.
+    """
     dev = qml.device("default.qubit", wires=n_qubits)
 
     @qml.qnode(dev, interface="torch", diff_method="parameter-shift")
     def circuit(inputs, weights):
         for layer in range(n_layers):
-            for i in range(n_qubits):
-                qml.RY(np.pi * inputs[i], wires=i)
+            if layer == 0 or reupload:
+                for i in range(n_qubits):
+                    qml.RY(np.pi * inputs[i], wires=i)
             for i in range(n_qubits):
                 qml.RY(weights[layer, i], wires=i)
             for i in range(n_qubits):
@@ -216,7 +227,7 @@ def build_vqc_deterministic(n_qubits: int, n_layers: int):
     return qml.qnn.TorchLayer(circuit, {"weights": (n_layers, n_qubits)})
 
 
-def build_vqc_shot_based(n_qubits: int, n_layers: int, n_shots: int):
+def build_vqc_shot_based(n_qubits: int, n_layers: int, n_shots: int, reupload: bool = True):
     """
     Shot-based VQC: each call samples n_shots measurements and returns the
     empirical mean of ⟨Z₀⟩. Running this multiple times gives the shot variance.
@@ -226,8 +237,9 @@ def build_vqc_shot_based(n_qubits: int, n_layers: int, n_shots: int):
     @qml.qnode(dev, interface="torch")
     def circuit(inputs, weights):
         for layer in range(n_layers):
-            for i in range(n_qubits):
-                qml.RY(np.pi * float(inputs[i]), wires=i)
+            if layer == 0 or reupload:
+                for i in range(n_qubits):
+                    qml.RY(np.pi * float(inputs[i]), wires=i)
             for i in range(n_qubits):
                 qml.RY(float(weights[layer, i]), wires=i)
             for i in range(n_qubits):
@@ -238,14 +250,15 @@ def build_vqc_shot_based(n_qubits: int, n_layers: int, n_shots: int):
 
 
 class HQCNNClassifier(nn.Module):
-    def __init__(self, n_qubits, n_layers, shot_based=False, n_shots=100):
+    def __init__(self, n_qubits, n_layers, shot_based=False, n_shots=100, reupload=True):
         super().__init__()
         self.n_qubits = n_qubits
         self.n_layers = n_layers
+        self.reupload = reupload
         if shot_based:
-            self.vqc = build_vqc_shot_based(n_qubits, n_layers, n_shots)
+            self.vqc = build_vqc_shot_based(n_qubits, n_layers, n_shots, reupload=reupload)
         else:
-            self.vqc = build_vqc_deterministic(n_qubits, n_layers)
+            self.vqc = build_vqc_deterministic(n_qubits, n_layers, reupload=reupload)
         self.bias = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
@@ -255,25 +268,41 @@ class HQCNNClassifier(nn.Module):
 
 
 def load_vqc_checkpoint(n_qubits, n_layers, lr,
-                        shot_based=False, n_shots=100) -> HQCNNClassifier:
-    """Reconstruct HQCNNClassifier and load saved weights from regime_A."""
-    model     = HQCNNClassifier(n_qubits, n_layers,
-                                shot_based=shot_based, n_shots=n_shots)
-    ckpt_name = f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt"
-    ckpt_path = VQC_CKPT_DIR / "regime_A" / ckpt_name   # ← regime_A subdir
+                        shot_based=False, n_shots=100,
+                        reupload=True) -> HQCNNClassifier:
+    """Reconstruct HQCNNClassifier and load saved weights from regime_A.
+    Searches for reupload-specific checkpoint name first, then generic name.
+    """
+    model = HQCNNClassifier(n_qubits, n_layers,
+                            shot_based=shot_based, n_shots=n_shots,
+                            reupload=reupload)
+    regime_dir = VQC_CKPT_DIR / "regime_A"
+
+    # Try reupload-specific name first, then generic
+    suffix    = "" if reupload else "_noreupload"
+    ckpt_name = f"vqc_q{n_qubits}_l{n_layers}_lr{lr}{suffix}.pt"
+    ckpt_path = regime_dir / ckpt_name
     if not ckpt_path.exists():
-        raise FileNotFoundError(
-            f"VQC checkpoint not found: {ckpt_path}\n"
-            "Run 3_5_vqc.py → run_regime_A() first."
-        )
+        # Fall back to unsuffixed name (older checkpoints or single-run format)
+        ckpt_path = regime_dir / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt"
+    if not ckpt_path.exists():
+        # Last resort: any checkpoint matching q/l
+        alts = sorted(regime_dir.glob(f"vqc_q{n_qubits}_l{n_layers}_lr{lr}*.pt"))
+        if alts:
+            ckpt_path = alts[0]
+        else:
+            raise FileNotFoundError(
+                f"VQC checkpoint not found: {regime_dir / ckpt_name}\n"
+                "Run 3_5_vqc.py → run_regime_A() first."
+            )
+
     state = torch.load(ckpt_path, map_location="cpu")
-    # Load into deterministic model; shot-based shares same weights
-    det_model = HQCNNClassifier(n_qubits, n_layers, shot_based=False)
+    # Load via a temporary model with the same ansatz to safely copy weights
+    det_model = HQCNNClassifier(n_qubits, n_layers, shot_based=False, reupload=reupload)
     det_model.load_state_dict(state)
-    # Copy weights to the target model
+    # Copy weights to the target model (may be shot-based)
     model.bias.data = det_model.bias.data.clone()
-    # VQC TorchLayer weights are stored as named parameters
-    for (name, p_src), (_, p_dst) in zip(
+    for (_, p_src), (_, p_dst) in zip(
         det_model.vqc.named_parameters(), model.vqc.named_parameters()
     ):
         p_dst.data = p_src.data.clone()
@@ -397,9 +426,10 @@ def quantum_shot_variance(model_det: HQCNNClassifier,
           f"{n_repeats}× with {n_shots} shots each.")
 
     # Build shot-based VQC with same weights as deterministic model
+    reupload_flag = getattr(model_det, "reupload", True)
     shot_model = HQCNNClassifier(
         model_det.n_qubits, model_det.n_layers,
-        shot_based=True, n_shots=n_shots
+        shot_based=True, n_shots=n_shots, reupload=reupload_flag
     )
     shot_model.bias.data = model_det.bias.data.clone()
     for (_, p_src), (_, p_dst) in zip(
@@ -622,15 +652,18 @@ def compare_regimes_uncertainty(y_test: np.ndarray):
     ]:
         ckpt = ckpt_dir / f"vqc_q{VQC_N_QUBITS}_l{VQC_N_LAYERS}_lr{VQC_LR}.pt"
         if not ckpt.exists():
-            # Regime B uses different lr
-            alts = list(ckpt_dir.glob(f"vqc_q{VQC_N_QUBITS}_l{VQC_N_LAYERS}_*.pt"))
+            # Try reupload-specific suffix, then any matching checkpoint
+            suffix = "" if VQC_REUPLOAD else "_noreupload"
+            ckpt = ckpt_dir / f"vqc_q{VQC_N_QUBITS}_l{VQC_N_LAYERS}_lr{VQC_LR}{suffix}.pt"
+        if not ckpt.exists():
+            alts = sorted(ckpt_dir.glob(f"vqc_q{VQC_N_QUBITS}_l{VQC_N_LAYERS}_*.pt"))
             if alts:
                 ckpt = alts[0]
             else:
                 print(f"  [SKIP] No checkpoint for Regime {regime}: {ckpt_dir}")
                 continue
 
-        model = HQCNNClassifier(VQC_N_QUBITS, VQC_N_LAYERS, shot_based=False)
+        model = HQCNNClassifier(VQC_N_QUBITS, VQC_N_LAYERS, shot_based=False, reupload=VQC_REUPLOAD)
         state = torch.load(ckpt, map_location="cpu")
         try:
             model.load_state_dict(state)
@@ -810,7 +843,7 @@ def main():
 
     # VQC (deterministic, best Regime A checkpoint)
     vqc_model = load_vqc_checkpoint(VQC_N_QUBITS, VQC_N_LAYERS, VQC_LR,
-                                     shot_based=False)
+                                     shot_based=False, reupload=VQC_REUPLOAD)
     vqc_model.eval()
 
     # Classical head for MC-Dropout

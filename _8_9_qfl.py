@@ -79,7 +79,10 @@ from flwr.server.strategy import FedAvg
 from flwr.server.client_proxy import ClientProxy
 
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import roc_auc_score, f1_score, accuracy_score, average_precision_score
+from sklearn.metrics import (
+    roc_auc_score, roc_curve, f1_score, accuracy_score,
+    average_precision_score, balanced_accuracy_score, matthews_corrcoef
+)
 
 from pipeline_utils import seed_everything
 
@@ -93,12 +96,12 @@ seed_everything(42)
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE         = PROJECT_ROOT / "outputs"
 FEAT_DIR     = BASE / "feature_outputs"
-VQC_CKPT_DIR = BASE / "vqc_outputs/regime_A"        # base dir — subdirs appended per regime
+VQC_CKPT_DIR = BASE / "vqc_outputs" / "regime_A"
 OUT_DIR      = BASE / "qfl_outputs"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def auto_detect_best_vqc_config(ckpt_dir: Path) -> Tuple[int, int, float]:
+def auto_detect_best_vqc_config(ckpt_dir: Path) -> Tuple[int, int, float, bool]:
     """Auto-detect the best VQC config from finalist_configs.json or Regime A checkpoint manifest."""
     finalists_file = ckpt_dir.parent / "finalist_configs.json"
     if finalists_file.exists():
@@ -110,9 +113,12 @@ def auto_detect_best_vqc_config(ckpt_dir: Path) -> Tuple[int, int, float]:
                 n_qubits = int(primary.get("n_qubits", 4))
                 n_layers = int(primary.get("n_layers", 2))
                 lr = float(primary.get("lr", 0.01))
+                reupload = bool(primary.get("reupload", True))
+                if "no reupload" in primary.get("notes", "").lower() or "noreupload" in primary.get("name", "").lower():
+                    reupload = False
                 print(f"  Auto-detect: using finalist config from {finalists_file.name} "
-                      f"q={n_qubits} l={n_layers} lr={lr}")
-                return n_qubits, n_layers, lr
+                      f"q={n_qubits} l={n_layers} lr={lr} reupload={reupload}")
+                return n_qubits, n_layers, lr, reupload
         except Exception:
             pass
 
@@ -123,40 +129,42 @@ def auto_detect_best_vqc_config(ckpt_dir: Path) -> Tuple[int, int, float]:
         n_qubits = int(m.get("n_qubits", 4))
         n_layers = int(m.get("n_layers", 2))
         lr = float(m.get("lr", 0.01))
+        reupload = bool(m.get("reupload", True))
         print(f"  Auto-detect: using manifest-selected VQC config "
-              f"q={n_qubits} l={n_layers} lr={lr} "
+              f"q={n_qubits} l={n_layers} lr={lr} reupload={reupload} "
               "(best validation AUC from sweep)")
-        return n_qubits, n_layers, lr
+        return n_qubits, n_layers, lr, reupload
 
     best_config = None
     best_auc = -1.0
     for ckpt in sorted(ckpt_dir.glob("vqc_q*_l*_lr*.pt")):
-        match = re.match(r"vqc_q(\d+)_l(\d+)_lr([\d.]+)\.pt", ckpt.name)
+        match = re.match(r"vqc_q(\d+)_l(\d+)_lr([\d.]+)(_noreupload)?\.pt", ckpt.name)
         if not match:
             continue
         nq, nl, lr = int(match.group(1)), int(match.group(2)), float(match.group(3))
-        history = ckpt_dir / f"vqc_q{nq}_l{nl}_lr{lr}_history.csv"
+        reup = not bool(match.group(4))
+        history = ckpt_dir / f"{ckpt.stem}_history.csv"
         if history.exists():
             try:
                 df = pd.read_csv(history)
                 val_auc = df["val_auc"].max()
                 if val_auc > best_auc:
                     best_auc = val_auc
-                    best_config = (nq, nl, lr)
+                    best_config = (nq, nl, lr, reup)
             except Exception:
                 continue
     if best_config is not None:
         print(f"  Auto-detect: best available VQC config q={best_config[0]} "
-              f"l={best_config[1]} lr={best_config[2]} "
+              f"l={best_config[1]} lr={best_config[2]} reupload={best_config[3]} "
               f"(val AUC={best_auc:.4f})")
         return best_config
 
     print("  [WARN] Could not auto-detect best VQC config from manifest or history. "
           "Falling back to defaults.")
-    return 4, 2, 0.01
+    return 4, 2, 0.01, True
 
 # ── Match to your best Regime A result ───────────────────────────────────────
-N_QUBITS, N_LAYERS, VQC_LR = auto_detect_best_vqc_config(VQC_CKPT_DIR)
+N_QUBITS, N_LAYERS, VQC_LR, VQC_REUPLOAD = auto_detect_best_vqc_config(VQC_CKPT_DIR)
 
 # ── FL hyperparameters ────────────────────────────────────────────────────────
 FL_CFG = {
@@ -188,14 +196,15 @@ DP_SIGMAS = [0.0, 0.01, 0.05, 0.10, 0.20, 0.50, 1.0, 2.0]
 #     self-contained execution without import dependency)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_vqc(n_qubits: int, n_layers: int):
+def build_vqc(n_qubits: int, n_layers: int, reupload: bool = True):
     dev = qml.device("default.qubit", wires=n_qubits)
 
     @qml.qnode(dev, interface="torch", diff_method="parameter-shift")
     def circuit(inputs, weights):
         for layer in range(n_layers):
-            for i in range(n_qubits):
-                qml.RY(np.pi * inputs[i], wires=i)
+            if layer == 0 or reupload:
+                for i in range(n_qubits):
+                    qml.RY(np.pi * inputs[i], wires=i)
             for i in range(n_qubits):
                 qml.RY(weights[layer, i], wires=i)
             for i in range(n_qubits):
@@ -207,11 +216,12 @@ def build_vqc(n_qubits: int, n_layers: int):
 
 class VQCModel(nn.Module):
     """Standalone VQC classifier — the federated layer."""
-    def __init__(self, n_qubits: int, n_layers: int):
+    def __init__(self, n_qubits: int, n_layers: int, reupload: bool = True):
         super().__init__()
         self.n_qubits = n_qubits
         self.n_layers = n_layers
-        self.vqc      = build_vqc(n_qubits, n_layers)
+        self.reupload = reupload
+        self.vqc      = build_vqc(n_qubits, n_layers, reupload=reupload)
         self.bias     = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
@@ -233,7 +243,11 @@ class VQCModel(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
-def find_best_vqc_checkpoint(ckpt_dir: Path, n_qubits: int, n_layers: int, lr: float) -> Optional[Path]:
+def find_best_vqc_checkpoint(ckpt_dir: Path, n_qubits: int, n_layers: int, lr: float, reupload: bool = True) -> Optional[Path]:
+    suffix = "" if reupload else "_noreupload"
+    exact_specific = ckpt_dir / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}{suffix}.pt"
+    if exact_specific.exists():
+        return exact_specific
     exact = ckpt_dir / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt"
     if exact.exists():
         return exact
@@ -247,20 +261,20 @@ def find_best_vqc_checkpoint(ckpt_dir: Path, n_qubits: int, n_layers: int, lr: f
     return None
 
 
-def load_pretrained_vqc(n_qubits: int, n_layers: int, lr: float) -> VQCModel:
+def load_pretrained_vqc(n_qubits: int, n_layers: int, lr: float, reupload: bool = True) -> VQCModel:
     """
     Warm-start the federated VQC from the best centralised Regime A checkpoint.
     This gives FL a head start and reduces rounds needed to converge.
     If checkpoint not found, starts from random initialisation.
     """
-    model    = VQCModel(n_qubits, n_layers)
-    ckpt     = find_best_vqc_checkpoint(VQC_CKPT_DIR, n_qubits, n_layers, lr)
+    model    = VQCModel(n_qubits, n_layers, reupload=reupload)
+    ckpt     = find_best_vqc_checkpoint(VQC_CKPT_DIR, n_qubits, n_layers, lr, reupload=reupload)
     if ckpt is not None and ckpt.exists():
         state = torch.load(ckpt, map_location="cpu")
         model.load_state_dict(state)
         print(f"  Warm-start from centralised checkpoint: {ckpt}")
     else:
-        print(f"  [INFO] No pretrained checkpoint found for q={n_qubits} l={n_layers} lr={lr}.")
+        print(f"  [INFO] No pretrained checkpoint found for q={n_qubits} l={n_layers} lr={lr} reupload={reupload}.")
         print("  Starting FL from random VQC initialisation.")
     return model
 
@@ -586,7 +600,7 @@ class QFLClient(fl.client.Client):
     def __init__(self, cid: str, X: np.ndarray, y: np.ndarray,
                  X_val: np.ndarray, y_val: np.ndarray,
                  n_qubits: int, n_layers: int,
-                 dp_sigma: float = 0.0):
+                 dp_sigma: float = 0.0, reupload: bool = True):
         self.cid      = cid
         self.X        = torch.tensor(X, dtype=torch.float32)
         self.y        = torch.tensor(y, dtype=torch.long)
@@ -595,7 +609,7 @@ class QFLClient(fl.client.Client):
         self.n_qubits = n_qubits
         self.n_layers = n_layers
         self.dp_sigma = dp_sigma
-        self.model    = VQCModel(n_qubits, n_layers)
+        self.model    = VQCModel(n_qubits, n_layers, reupload=reupload)
 
     def get_parameters(self, ins: GetParametersIns) -> GetParametersRes:
         params = ndarrays_to_parameters(self.model.get_parameters())
@@ -677,6 +691,7 @@ def run_federated_simulation(partitions: dict,
                               n_qubits: int, n_layers: int,
                               n_rounds: int,
                               dp_sigma: float = 0.0,
+                              reupload: bool = True,
                               warm_start_params: Optional[List[np.ndarray]] = None,
                               ) -> Tuple[pd.DataFrame, dict]:
     """
@@ -694,7 +709,7 @@ def run_federated_simulation(partitions: dict,
     client_names = list(partitions.keys())
 
     # ── Initialise global model ───────────────────────────────────────────
-    global_model = VQCModel(n_qubits, n_layers)
+    global_model = VQCModel(n_qubits, n_layers, reupload=reupload)
     if warm_start_params is not None:
         global_model.set_parameters(warm_start_params)
     global_params = global_model.get_parameters()
@@ -707,7 +722,7 @@ def run_federated_simulation(partitions: dict,
             y=partitions[name]["y"],
             X_val=X_val, y_val=y_val,
             n_qubits=n_qubits, n_layers=n_layers,
-            dp_sigma=dp_sigma,
+            dp_sigma=dp_sigma, reupload=reupload,
         )
         for name in client_names
     }
@@ -810,14 +825,14 @@ def run_federated_simulation(partitions: dict,
 
 def run_centralised_baseline(X_train, y_train, X_val, y_val,
                               X_test, y_test, n_qubits, n_layers,
-                              warm_start_params=None) -> dict:
+                              warm_start_params=None, reupload: bool = True) -> dict:
     """
     Train the same VQC on the full pooled training set (no federation).
     Equivalent number of gradient steps as FL (n_rounds × local_epochs)
     for a fair comparison.
     """
     print("\n  ── Centralised baseline (pooled training) ──")
-    model    = VQCModel(n_qubits, n_layers)
+    model    = VQCModel(n_qubits, n_layers, reupload=reupload)
     if warm_start_params is not None:
         model.set_parameters(warm_start_params)
 
@@ -1086,14 +1101,14 @@ def main():
 
     # ── Warm-start parameters from centralised Regime A ───────────────────
     print("\n[3/8] Loading warm-start checkpoint...")
-    pretrained = load_pretrained_vqc(N_QUBITS, N_LAYERS, VQC_LR)
+    pretrained = load_pretrained_vqc(N_QUBITS, N_LAYERS, VQC_LR, reupload=VQC_REUPLOAD)
     warm_params = pretrained.get_parameters()
 
     # ── Centralised baseline ──────────────────────────────────────────────
     print("\n[4/8] Running centralised baseline...")
     centralised_result = run_centralised_baseline(
         X_train, y_train, X_val, y_val, X_test, y_test,
-        N_QUBITS, N_LAYERS, warm_start_params=warm_params
+        N_QUBITS, N_LAYERS, warm_start_params=warm_params, reupload=VQC_REUPLOAD
     )
     print(f"  Centralised — Test AUC={centralised_result['test_auc']:.4f} "
           f"F1={centralised_result['test_f1']:.4f}")
@@ -1116,6 +1131,7 @@ def main():
         partitions, X_val, y_val, X_test, y_test,
         N_QUBITS, N_LAYERS, FL_CFG["n_rounds"],
         dp_sigma=0.0,
+        reupload=VQC_REUPLOAD,
         warm_start_params=warm_params,
     )
     fed_history.to_csv(OUT_DIR / "federated_training.csv", index=False, encoding="utf-8-sig")
@@ -1142,6 +1158,7 @@ def main():
             partitions, X_val, y_val, X_test, y_test,
             N_QUBITS, N_LAYERS, FL_CFG["n_rounds"],
             dp_sigma=sigma,
+            reupload=VQC_REUPLOAD,
             warm_start_params=warm_params,
         )
         dp_results.append(dp_metrics)
