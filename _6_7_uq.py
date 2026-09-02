@@ -936,15 +936,16 @@ def main():
 
     T_opt, probs_scaled, logits_scaled = temperature_scale_vqc(
         vqc_model, X_val_scaled, y_val)
+    ece_before = expected_calibration_error(y_test, vqc_probs)
     ece_after  = expected_calibration_error(y_test, probs_scaled)
     auc_scaled = roc_auc_score(y_test, logits_scaled)
     aupr_scaled = average_precision_score(y_test, probs_scaled) if len(set(y_test)) > 1 else 0.0
     print(f"  Optimal T     : {T_opt:.4f}  "
           f"({'overconfident → softened' if T_opt > 1 else 'underconfident → sharpened'})")
-    print(f"  ECE before    : {q_ece:.4f}")
+    print(f"  ECE before    : {ece_before:.4f}")
     print(f"  ECE after     : {ece_after:.4f}  "
-          f"({'improved ✓' if ece_after < q_ece else 'no improvement'})")
-    print(f"  AUC (scaled)  : {auc_scaled:.4f}  (should match pre-scaling: {q_auc:.4f})")
+          f"({'improved ✓' if ece_after < ece_before else 'no improvement'})")
+    print(f"  AUC (scaled)  : {auc_scaled:.4f}  (matches pre-scaling: {vqc_auc:.4f})")
 
     plot_calibration_comparison(
         y_test, vqc_probs, probs_scaled, T_opt,
@@ -958,14 +959,14 @@ def main():
 
     summary["temperature_scaling"] = {
         "T_optimal":  round(T_opt, 4),
-        "ece_before": round(q_ece,     4),
+        "ece_before": round(ece_before, 4),
         "ece_after":  round(ece_after, 4),
         "auc_scaled": round(auc_scaled, 4),
         "aupr_scaled": round(aupr_scaled, 4),
         "note": ("T > 1 means VQC was overconfident; "
                  "temperature scaling softens sigmoid outputs. "
                  "AUC is invariant to monotone rescaling — "
-                 "confirm auc_scaled ≈ quantum_shot_variance auc.")
+                 "confirm auc_scaled ≈ vqc point-estimate auc.")
     }
 
     # ── Save summary ──────────────────────────────────────────────────────
