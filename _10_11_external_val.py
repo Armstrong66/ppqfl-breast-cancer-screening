@@ -637,13 +637,16 @@ def plot_cross_population(mendeley_results: dict,
 # 6.  PARAMETER EFFICIENCY COMPARISON
 # ══════════════════════════════════════════════════════════════════════════════
 
-def plot_parameter_efficiency(all_results: list, save_path: Path):
+def plot_parameter_efficiency(all_results: Union[list, pd.DataFrame], save_path: Path):
     """
     Scatter plot: trainable parameter count (log scale) vs test AUC.
     The quantum utility argument rests on the VQC sitting in the upper-left
     quadrant — high AUC, very few parameters. This is the key figure for
     reporting quantum advantage in low-resource settings.
     """
+    if isinstance(all_results, pd.DataFrame):
+        all_results = all_results.to_dict(orient="records")
+
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     fig.suptitle("Parameter Efficiency: Trainable Parameters vs Performance\n"
                  "Quantum Utility in Low-Resource LMIC Deployment Context",
@@ -685,7 +688,7 @@ def plot_parameter_efficiency(all_results: list, save_path: Path):
         ax.set_xlabel("Trainable Parameters (log scale)")
         ax.set_ylabel("AUC-ROC")
         ax.set_title(title)
-        ax.set_ylim([0.5, 1.05])
+        ax.set_ylim([0.2, 1.05])
         ax.grid(True, alpha=0.3)
         # Target quadrant annotation
         ax.axhline(0.90, color="gray", linestyle=":", alpha=0.5)
@@ -1529,7 +1532,7 @@ def main():
             "kau_auc":          k_auc,
         })
     if eff_rows:
-        plot_parameter_efficiency(pd.DataFrame(eff_rows), OUT_DIR / "parameter_efficiency.png")
+        plot_parameter_efficiency(eff_rows, OUT_DIR / "parameter_efficiency.png")
 
     # ── Summary text report ───────────────────────────────────────────────
     write_summary_report(master_df, shift_metrics, OUT_DIR / "executive_summary.md")
