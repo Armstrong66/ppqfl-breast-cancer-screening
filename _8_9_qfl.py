@@ -107,9 +107,20 @@ def auto_detect_best_vqc_config(ckpt_dir: Path) -> Tuple[int, int, float, bool]:
     if finalists_file.exists():
         try:
             with open(finalists_file) as f:
-                finalists = json.load(f)
-            if finalists:
-                primary = finalists[0]
+                finalists_data = json.load(f)
+            primary = None
+            if isinstance(finalists_data, dict):
+                perf_list = finalists_data.get("performance_finalists", [])
+                if perf_list:
+                    primary = perf_list[0]
+                else:
+                    eff_list = finalists_data.get("efficiency_finalists", [])
+                    if eff_list:
+                        primary = eff_list[0]
+            elif isinstance(finalists_data, list) and len(finalists_data) > 0:
+                primary = finalists_data[0]
+
+            if primary:
                 n_qubits = int(primary.get("n_qubits", 4))
                 n_layers = int(primary.get("n_layers", 2))
                 lr = float(primary.get("lr", 0.01))
@@ -451,6 +462,8 @@ def run_classical_fedavg_baseline(partitions: dict,
         "opt_threshold": round(tau_c, 4),
         "test_accuracy": round(accuracy_score(y_test, test_preds_opt), 4),
         "params": global_model.count_params(),
+        "architecture": "MicroMLPClassifier",
+        "input_dim": input_dim,
         "n_rounds": n_rounds,
     }
 
@@ -1027,6 +1040,22 @@ def privacy_analysis_report(partitions: dict,
             "classical_fedavg_test_f1": (
                 classical_baseline_result["test_f1"]
                 if classical_baseline_result is not None else None
+            ),
+            "classical_fedavg_architecture": (
+                classical_baseline_result.get("architecture", "MicroMLPClassifier")
+                if classical_baseline_result is not None else "MicroMLPClassifier"
+            ),
+            "classical_fedavg_params": (
+                classical_baseline_result.get("params", None)
+                if classical_baseline_result is not None else None
+            ),
+            "classical_fedavg_input_dim": (
+                classical_baseline_result.get("input_dim", N_QUBITS)
+                if classical_baseline_result is not None else N_QUBITS
+            ),
+            "classical_fedavg_description": (
+                "Parameter-matched 2-layer micro-MLP control trained on top PCA features "
+                "via FedAvg (not the full MobileNetV2 CNN backbone)."
             ),
             "interpretation":        (
                 f"Federated training achieves {fed_result['final_test_auc']:.4f} AUC "

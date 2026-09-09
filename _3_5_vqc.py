@@ -33,6 +33,7 @@ Environment: CPU (quantum simulation — no GPU needed for VQC)
 import os, json, pickle, shutil, warnings, itertools
 from pathlib import Path
 from copy import deepcopy
+from typing import Union, List, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -693,7 +694,11 @@ def build_ablation_table(all_results: list, baseline_json: Path) -> pd.DataFrame
             "Notes":           r.get("notes", ""),
         })
 
+    # ── Deduplicate duplicate rows (e.g. reupload ablation identical to sweep) ──
     df = pd.DataFrame(rows)
+    # Deduplicate while preserving order
+    dedup_cols = ["Model", "Regime", "Qubits", "Layers", "TrainableParams", "NoiseSigma", "ValAUC", "TestAUC"]
+    df = df.drop_duplicates(subset=dedup_cols, keep="first").reset_index(drop=True)
     return df
 
 
@@ -1060,29 +1065,24 @@ def _plot_sweep_heatmap(results: list, out: Path):
     print(f"  Sweep heatmap saved: {out / 'sweep_heatmap.png'}")
 
 
-def select_top_sweep_configs(results: list, top_k: int = 3, candidate_pool: int = 12) -> list:
+def select_top_sweep_configs(results: list, top_k: int = 3) -> list:
+    """
+    Select top sweep configurations strictly by validation AUC (and secondarily test metrics),
+    ensuring global top performers (such as q6_l3 or q8_l3) are never filtered out.
+    """
     if not results:
         return []
-    ranked = sorted(results, key=lambda r: (
-        -r["best_val_auc"], -r.get("test_f1", 0.0), r["vqc_params"], r["n_qubits"], r["n_layers"]
-    ))
-    pool = ranked[:candidate_pool]
+    # Deduplicate by configuration signature (params, qubits, layers, reupload)
     unique = []
     seen = set()
-    for r in pool:
-        key = (r["vqc_params"], r["n_qubits"], r["n_layers"])
+    for r in sorted(results, key=lambda x: (-x.get("best_val_auc", 0.0), -x.get("test_aupr", 0.0), -x.get("test_f1", 0.0))):
+        key = (r["n_qubits"], r["n_layers"], r.get("reupload", True))
         if key in seen:
             continue
         seen.add(key)
         unique.append(r)
 
-    selected = sorted(unique, key=lambda r: (
-        r["vqc_params"], -r["best_val_auc"], -r.get("test_f1", 0.0), r["n_qubits"], r["n_layers"]
-    ))[:top_k]
-
-    return sorted(selected, key=lambda r: (
-        r["vqc_params"], -r["best_val_auc"], -r.get("test_f1", 0.0), r["n_qubits"], r["n_layers"]
-    ))
+    return unique[:top_k]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1194,69 +1194,115 @@ def export_finalist_configs(regime_A_results: list, regime_B_results: list, swee
     """
     Tier 1 Item 2 Stage A: Select top finalist configurations and export finalist_configs.json.
     """
-    candidates_A = sorted(regime_A_results + [r for r in sweep_results if r.get("regime", "").startswith("A")],
-                          key=lambda r: (-r["best_val_auc"], r["vqc_params"], r["n_qubits"], r["n_layers"]))
-    best_A1 = candidates_A[0] if candidates_A else None
-    
-    best_A2 = None
-    if best_A1:
-        for r in candidates_A[1:]:
-            if (r["n_qubits"], r["n_layers"]) != (best_A1["n_qubits"], best_A1["n_layers"]):
-                best_A2 = r
-                break
-        if best_A2 is None and len(candidates_A) > 1:
-            best_A2 = candidates_A[1]
+def select_finalists(sweep_results: list, top_k: int = 3, min_val_auc: float = 0.88) -> dict:
+    """
+    Select two explicitly labeled, non-exclusive categories of finalists:
+      - performance_finalists: top_k strictly by val_auc (headline comparison)
+      - efficiency_finalists: smallest parameter count that clears min_val_auc
+    """
+    def to_finalist_dict(r, rank_label):
+        nq = int(r["n_qubits"])
+        nl = int(r["n_layers"])
+        lr = float(r["lr"])
+        reup = bool(r.get("reupload", True))
+        regime_str = r.get("regime", "A")
+        regime_code = "B" if "B" in regime_str else "A"
+        reup_tag = "" if reup else "_noreup"
+        return {
+            "name": f"HQCNN_{regime_code}_q{nq}_l{nl}{reup_tag}",
+            "regime": regime_code,
+            "n_qubits": nq,
+            "n_layers": nl,
+            "lr": lr,
+            "reupload": reup,
+            "val_auc": float(r.get("best_val_auc", r.get("val_auc", 0.0))),
+            "test_auc": float(r.get("test_auc_roc", r.get("test_auc", 0.0))),
+            "test_aupr": float(r.get("test_aupr", 0.0)),
+            "vqc_params": int(r.get("vqc_params", nq * nl + 1)),
+            "rank": rank_label,
+            "notes": r.get("notes", ""),
+        }
 
-    best_B = max(regime_B_results, key=lambda r: r["best_val_auc"]) if regime_B_results else None
+    # Rank by validation performance
+    ranked_by_perf = sorted(sweep_results, key=lambda r: (
+        -r.get("best_val_auc", r.get("val_auc", 0.0)),
+        -r.get("test_aupr", 0.0),
+        r.get("vqc_params", 999)
+    ))
+    perf_finalists = [to_finalist_dict(r, f"Performance Finalist #{i+1}") for i, r in enumerate(ranked_by_perf[:top_k])]
 
-    finalists = []
-    if best_A1:
-        finalists.append({
-            "name": f"HQCNN_A_q{best_A1['n_qubits']}_l{best_A1['n_layers']}",
-            "regime": "A",
-            "n_qubits": int(best_A1["n_qubits"]),
-            "n_layers": int(best_A1["n_layers"]),
-            "lr": float(best_A1["lr"]),
-            "val_auc": float(best_A1["best_val_auc"]),
-            "test_auc": float(best_A1.get("test_auc_roc", 0.0)),
-            "vqc_params": int(best_A1["vqc_params"]),
-            "rank": "Regime A Primary Finalist",
-        })
-    if best_A2:
-        finalists.append({
-            "name": f"HQCNN_A_q{best_A2['n_qubits']}_l{best_A2['n_layers']}",
-            "regime": "A",
-            "n_qubits": int(best_A2["n_qubits"]),
-            "n_layers": int(best_A2["n_layers"]),
-            "lr": float(best_A2["lr"]),
-            "val_auc": float(best_A2["best_val_auc"]),
-            "test_auc": float(best_A2.get("test_auc_roc", 0.0)),
-            "vqc_params": int(best_A2["vqc_params"]),
-            "rank": "Regime A Secondary Finalist",
-        })
-    if best_B:
-        finalists.append({
+    # Rank by efficiency among those clearing min_val_auc
+    eligible = [r for r in sweep_results if r.get("best_val_auc", r.get("val_auc", 0.0)) >= min_val_auc]
+    if not eligible:
+        # Fallback to all results if threshold is too strict
+        eligible = sweep_results
+    ranked_by_size = sorted(eligible, key=lambda r: (
+        r.get("vqc_params", 999),
+        -r.get("best_val_auc", r.get("val_auc", 0.0))
+    ))
+    # Deduplicate efficiency finalists by (qubits, layers, reupload)
+    eff_unique = []
+    seen_eff = set()
+    for r in ranked_by_size:
+        key = (r["n_qubits"], r["n_layers"], r.get("reupload", True))
+        if key not in seen_eff:
+            seen_eff.add(key)
+            eff_unique.append(r)
+
+    eff_finalists = [to_finalist_dict(r, f"Efficiency Finalist #{i+1}") for i, r in enumerate(eff_unique[:top_k])]
+
+    return {
+        "performance_finalists": perf_finalists,
+        "efficiency_finalists": eff_finalists,
+        "min_val_auc_threshold_used": float(min_val_auc),
+    }
+
+
+def export_finalist_configs(regime_A_results: list, regime_B_results: list, sweep_results: list,
+                            baseline_val_auc: float = 0.98) -> dict:
+    """
+    Tier 1 Item 2 Stage A & Priority 0:
+    Select performance and efficiency finalists and export structured finalist_configs.json.
+    """
+    all_vqc_runs = []
+    for r in regime_A_results + sweep_results:
+        all_vqc_runs.append(r)
+
+    # Adaptive minimum validation AUC for efficiency finalists (e.g. classical baseline val AUC - 0.10)
+    adaptive_min_val_auc = max(0.85, baseline_val_auc - 0.10)
+
+    finalist_dict = select_finalists(all_vqc_runs, top_k=3, min_val_auc=adaptive_min_val_auc)
+
+    # If Regime B exists, add top Regime B to performance finalists if not already present
+    if regime_B_results:
+        best_B = max(regime_B_results, key=lambda r: r.get("best_val_auc", 0.0))
+        finalist_dict["regime_b_finalist"] = {
             "name": f"HQCNN_B_q{best_B['n_qubits']}_l{best_B['n_layers']}",
             "regime": "B",
             "n_qubits": int(best_B["n_qubits"]),
             "n_layers": int(best_B["n_layers"]),
             "lr": float(best_B["lr"]),
-            "val_auc": float(best_B["best_val_auc"]),
+            "reupload": True,
+            "val_auc": float(best_B.get("best_val_auc", 0.0)),
             "test_auc": float(best_B.get("test_auc_roc", 0.0)),
-            "vqc_params": int(best_B["vqc_params"]),
+            "vqc_params": int(best_B.get("vqc_params", best_B["n_qubits"] * best_B["n_layers"] + 1)),
             "rank": "Regime B Primary Finalist",
-        })
+        }
 
     finalist_path = OUT_DIR / "finalist_configs.json"
     with open(finalist_path, "w") as f:
-        json.dump(finalists, f, indent=2)
+        json.dump(finalist_dict, f, indent=2)
     print(f"\n  ✓ Exported finalist configurations to: {finalist_path}")
-    return finalists
+    print(f"    Performance finalists: {[f['name'] for f in finalist_dict['performance_finalists']]}")
+    print(f"    Efficiency finalists:  {[f['name'] for f in finalist_dict['efficiency_finalists']]}")
+    return finalist_dict
 
 
-def run_repeated_cv(finalist_configs: list, n_splits: int = 5, n_repeats: int = 3) -> dict:
+def run_repeated_cv(finalist_configs: Union[list, dict], n_splits: int = 5, n_repeats: int = 3) -> dict:
     """
-    Tier 1 Items 1 & 2 Stages B & C: Repeated Stratified CV for controls and finalist VQCs.
+    Tier 1 Items 1 & 2 Stages B & C, Priority 0 & 5:
+    Repeated Stratified CV for controls and the union of performance + efficiency finalists.
+    Logs explicit TrainableParams column in cv_summary.csv.
     """
     print("\n" + "═"*70)
     print(f"  CROSS-VALIDATION EVALUATION ({n_splits}-fold × {n_repeats}-repeat = {n_splits*n_repeats} folds)")
@@ -1281,6 +1327,8 @@ def run_repeated_cv(finalist_configs: list, n_splits: int = 5, n_repeats: int = 
         X_all = np.vstack([f_tr, f_va, f_te])
         
         fold_aucs, fold_auprs, fold_f1s = [], [], []
+        mlp_sample = ClassicalMicroMLP(dim, hidden_dim=2)
+        n_params = mlp_sample.count_params()
         for fold, (tr_idx, te_idx) in enumerate(rskf.split(X_all, y_all)):
             X_tr, y_tr = X_all[tr_idx], y_all[tr_idx]
             X_te, y_te = X_all[te_idx], y_all[te_idx]
@@ -1317,6 +1365,7 @@ def run_repeated_cv(finalist_configs: list, n_splits: int = 5, n_repeats: int = 
         lbl = f"Micro-MLP (dim={dim})"
         cv_results[lbl] = {
             "model": lbl,
+            "trainable_params": n_params,
             "auc_mean": round(float(np.mean(fold_aucs)), 4),
             "auc_std": round(float(np.std(fold_aucs)), 4),
             "aupr_mean": round(float(np.mean(fold_auprs)), 4),
@@ -1325,14 +1374,30 @@ def run_repeated_cv(finalist_configs: list, n_splits: int = 5, n_repeats: int = 
             "f1_std": round(float(np.std(fold_f1s)), 4),
             "fold_aucs": [round(x, 4) for x in fold_aucs],
         }
-        print(f"  CV [Stage B] {lbl:25s} | AUC: {np.mean(fold_aucs):.4f} ± {np.std(fold_aucs):.4f} | PR-AUC: {np.mean(fold_auprs):.4f} ± {np.std(fold_auprs):.4f}")
+        print(f"  CV [Stage B] {lbl:25s} ({n_params} params) | AUC: {np.mean(fold_aucs):.4f} ± {np.std(fold_aucs):.4f} | PR-AUC: {np.mean(fold_auprs):.4f} ± {np.std(fold_auprs):.4f}")
 
-    # Stage C: Finalist VQCs
-    for cfg in finalist_configs[:2]:
+    # Stage C: Union of Performance & Efficiency Finalists (de-duplicated)
+    eval_configs = []
+    if isinstance(finalist_configs, dict):
+        eval_configs = finalist_configs.get("performance_finalists", []) + finalist_configs.get("efficiency_finalists", [])
+    elif isinstance(finalist_configs, list):
+        eval_configs = finalist_configs
+
+    unique_configs = []
+    seen_keys = set()
+    for cfg in eval_configs:
+        key = (cfg["n_qubits"], cfg["n_layers"], cfg.get("reupload", True))
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_configs.append(cfg)
+
+    for cfg in unique_configs:
         nq = cfg["n_qubits"]
         nl = cfg["n_layers"]
         lr = cfg.get("lr", 0.01)
+        reup = cfg.get("reupload", True)
         name = cfg.get("name", f"HQCNN_q{nq}_l{nl}")
+        vqc_params = int(cfg.get("vqc_params", nq * nl + 1))
         
         f_tr = np.load(FEAT_DIR / f"features_train_pca{nq}.npy")
         f_va = np.load(FEAT_DIR / f"features_val_pca{nq}.npy")
@@ -1348,7 +1413,7 @@ def run_repeated_cv(finalist_configs: list, n_splits: int = 5, n_repeats: int = 
             X_tr_s = sc.transform(X_tr)
             X_te_s = sc.transform(X_te)
             
-            vqc = HQCNNClassifier(nq, nl)
+            vqc = HQCNNClassifier(nq, nl, reupload=reup)
             opt = optim.Adam(vqc.parameters(), lr=lr)
             crit = nn.BCELoss()
             ds = TensorDataset(torch.tensor(X_tr_s, dtype=torch.float32), torch.tensor(y_tr, dtype=torch.float32))
@@ -1375,6 +1440,7 @@ def run_repeated_cv(finalist_configs: list, n_splits: int = 5, n_repeats: int = 
             
         cv_results[name] = {
             "model": name,
+            "trainable_params": vqc_params,
             "auc_mean": round(float(np.mean(fold_aucs)), 4),
             "auc_std": round(float(np.std(fold_aucs)), 4),
             "aupr_mean": round(float(np.mean(fold_auprs)), 4),
@@ -1383,12 +1449,12 @@ def run_repeated_cv(finalist_configs: list, n_splits: int = 5, n_repeats: int = 
             "f1_std": round(float(np.std(fold_f1s)), 4),
             "fold_aucs": [round(x, 4) for x in fold_aucs],
         }
-        print(f"  CV [Stage C] {name:25s} | AUC: {np.mean(fold_aucs):.4f} ± {np.std(fold_aucs):.4f} | PR-AUC: {np.mean(fold_auprs):.4f} ± {np.std(fold_auprs):.4f}")
+        print(f"  CV [Stage C] {name:25s} ({vqc_params} params) | AUC: {np.mean(fold_aucs):.4f} ± {np.std(fold_aucs):.4f} | PR-AUC: {np.mean(fold_auprs):.4f} ± {np.std(fold_auprs):.4f}")
 
     with open(OUT_DIR / "cv_results.json", "w") as f:
         json.dump(cv_results, f, indent=2)
     pd.DataFrame(list(cv_results.values())).to_csv(OUT_DIR / "cv_summary.csv", index=False)
-    print(f"  ✓ Saved CV summary: {OUT_DIR / 'cv_summary.csv'}")
+    print(f"  ✓ Saved CV summary with parameter counts: {OUT_DIR / 'cv_summary.csv'}")
     return cv_results
 
 
@@ -1418,28 +1484,42 @@ def main():
     regime_B_results = run_regime_B()
     all_results.extend(regime_B_results)
 
-    # ── 4b_: Noise robustness ────────────────────────────────────────────
-    best_A = max(regime_A_results, key=lambda r: r["best_val_auc"])
-    noise_results = run_noise_robustness(best_A)
-    for nr in noise_results:
-        if nr["noise_sigma"] > 0:
-            nr["regime"]  = "A — noise robustness"
-            nr["vqc_params"] = best_A["vqc_params"]
-            nr["notes"]   = f"σ={nr['noise_sigma']}"
-            nr["best_val_auc"] = best_A["best_val_auc"]
-            all_results.append(nr)
-
     # ── 5_: Hyperparameter sweep ────────────────────────────────────────
     sweep_results = run_sweep()
     for r in sweep_results:
         r["notes"] = f"sweep lr={r['lr']}"
     all_results.extend(sweep_results)
 
-    # ── Export finalist configurations (Tier 1 Item 2 Stage A) ───────────
-    finalists = export_finalist_configs(regime_A_results, regime_B_results, sweep_results)
+    # ── Export finalist configurations (Priority 0) ──────────────────────
+    baseline_val_auc = 0.98
+    if BASELINE_JSON.exists():
+        try:
+            with open(BASELINE_JSON) as f:
+                baseline_val_auc = float(json.load(f).get("best_val_auc", 0.98))
+        except Exception:
+            pass
 
-    # ── Data re-uploading ablation (Tier 1 Item 6) ──────────────────────
-    reupload_ablation_results = run_reuploading_ablation(finalists[:2])
+    finalists = export_finalist_configs(regime_A_results, regime_B_results, sweep_results,
+                                        baseline_val_auc=baseline_val_auc)
+
+    # ── 4b_: Noise robustness on Top Performance Finalist ────────────────
+    perf_finalists = finalists.get("performance_finalists", [])
+    primary_finalist = perf_finalists[0] if perf_finalists else max(regime_A_results + sweep_results, key=lambda r: r.get("best_val_auc", 0.0))
+    print(f"\n  Running noise robustness on Primary Performance Finalist: {primary_finalist['name']} "
+          f"(q={primary_finalist['n_qubits']}, l={primary_finalist['n_layers']}, lr={primary_finalist['lr']})")
+    noise_results = run_noise_robustness(primary_finalist)
+    for nr in noise_results:
+        if nr["noise_sigma"] > 0:
+            nr["regime"]  = "A — noise robustness"
+            nr["vqc_params"] = primary_finalist.get("vqc_params", primary_finalist["n_qubits"] * primary_finalist["n_layers"] + 1)
+            nr["notes"]   = f"σ={nr['noise_sigma']}"
+            nr["best_val_auc"] = primary_finalist.get("val_auc", primary_finalist.get("best_val_auc", 0.0))
+            all_results.append(nr)
+
+    # ── Data re-uploading ablation on Top Finalists ──────────────────────
+    eval_ablation_configs = (finalists.get("performance_finalists", [])[:1] +
+                             finalists.get("efficiency_finalists", [])[:1])
+    reupload_ablation_results = run_reuploading_ablation(eval_ablation_configs)
     all_results.extend(reupload_ablation_results)
 
     # ── Classical control baselines ──────────────────────────────────────────

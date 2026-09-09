@@ -51,6 +51,7 @@ Prerequisites: _3_5_vqc.py must have been run (Regime A checkpoint needed)
 import json, pickle, warnings
 from pathlib import Path
 from copy import deepcopy
+from typing import Optional, Tuple, List, Dict, Union, Any
 import re
 
 import numpy as np
@@ -100,14 +101,21 @@ def auto_detect_best_vqc_config(ckpt_dir: Path) -> tuple:
     import re
     ckpt_dir = Path(ckpt_dir)
  
-    # Priority 0: finalist_configs.json written by Tier 1 Stage A
+    # Priority 0: finalist_configs.json written by Tier 1 Stage A / Priority 0 redesign
     finalists_file = ckpt_dir.parent / "finalist_configs.json"
     if finalists_file.exists():
         try:
             with open(finalists_file) as f:
-                finalists = json.load(f)
-            if finalists:
-                primary = finalists[0]
+                finalists_data = json.load(f)
+            primary = None
+            if isinstance(finalists_data, dict):
+                perf_list = finalists_data.get("performance_finalists", [])
+                if perf_list:
+                    primary = perf_list[0]
+            elif isinstance(finalists_data, list) and len(finalists_data) > 0:
+                primary = finalists_data[0]
+            
+            if primary:
                 cfg_q  = int(primary["n_qubits"])
                 cfg_l  = int(primary["n_layers"])
                 cfg_lr = float(primary["lr"])
@@ -306,7 +314,8 @@ def load_vqc_checkpoint(n_qubits, n_layers, lr,
         det_model.vqc.named_parameters(), model.vqc.named_parameters()
     ):
         p_dst.data = p_src.data.clone()
-    print(f"  Loaded VQC checkpoint: {ckpt_path}")
+    w_norm = sum(torch.norm(p).item() for p in model.parameters())
+    print(f"  Loaded VQC checkpoint: {ckpt_path} (weight norm={w_norm:.4f}, bias={model.bias.item():.4f})")
     return model
 
 
@@ -437,6 +446,9 @@ def quantum_shot_variance(model_det: HQCNNClassifier,
         shot_model.vqc.named_parameters()
     ):
         p_dst.data = p_src.data.clone()
+    det_norm = sum(torch.norm(p).item() for p in model_det.parameters())
+    shot_norm = sum(torch.norm(p).item() for p in shot_model.parameters())
+    print(f"  Verified weight transfer: deterministic norm={det_norm:.4f}, shot model norm={shot_norm:.4f}")
     shot_model.eval()
 
     N = len(X_test)
@@ -717,7 +729,8 @@ def compare_regimes_uncertainty(y_test: np.ndarray):
 
 def temperature_scale_vqc(vqc_model: HQCNNClassifier,
                            X_val: np.ndarray,
-                           y_val: np.ndarray) -> tuple:
+                           y_val: np.ndarray,
+                           X_test: Optional[np.ndarray] = None) -> tuple:
     """
     Learn a scalar temperature T on the validation set that minimises
     negative log-likelihood of the re-scaled VQC outputs.
@@ -740,19 +753,16 @@ def temperature_scale_vqc(vqc_model: HQCNNClassifier,
     Returns:
       T_opt       : float — optimal temperature
       probs_scaled: ndarray — re-calibrated test probabilities
+      logits_scaled: ndarray — scaled test logits
     """
     X_val_t = torch.tensor(X_val, dtype=torch.float32)
 
     # Collect raw logits from VQC (before sigmoid) on val set
     vqc_model.eval()
     with torch.no_grad():
-        raw_logits = []
-        for i in range(len(X_val_t)):
-            xi   = X_val_t[i]
-            z    = vqc_model.vqc(xi)          # ⟨Z₀⟩ ∈ [-1, 1]
-            raw_logits.append((z + vqc_model.bias).item())
-    logits_val = torch.tensor(raw_logits, dtype=torch.float32)
-    labels_val = torch.tensor(y_val,      dtype=torch.float32)
+        out_val = torch.stack([vqc_model.vqc(X_val_t[i]) for i in range(len(X_val_t))])
+        logits_val = (out_val + vqc_model.bias).view(-1)
+    labels_val = torch.tensor(y_val, dtype=torch.float32)
 
     # Optimise T via NLL on val set
     T = torch.nn.Parameter(torch.ones(1))
@@ -769,25 +779,23 @@ def temperature_scale_vqc(vqc_model: HQCNNClassifier,
     # Keep the final temperature within the optimisation bounds used during fitting.
     T_opt = float(T.clamp(min=0.05).item())
 
-    # Re-fit scaler on train to avoid leakage
-    X_train_pca = np.load(FEAT_DIR / f"features_train_pca{VQC_N_QUBITS}.npy")
-    scaler      = MinMaxScaler().fit(X_train_pca)
-    X_test_raw  = np.load(FEAT_DIR / f"features_test_pca{VQC_N_QUBITS}.npy")
-    X_test_sc   = scaler.transform(X_test_raw)
-    X_test_t    = torch.tensor(X_test_sc, dtype=torch.float32)
+    if X_test is None:
+        nq = getattr(vqc_model, "n_qubits", VQC_N_QUBITS)
+        X_train_pca = np.load(FEAT_DIR / f"features_train_pca{nq}.npy")
+        scaler      = MinMaxScaler().fit(X_train_pca)
+        X_test_raw  = np.load(FEAT_DIR / f"features_test_pca{nq}.npy")
+        X_test      = scaler.transform(X_test_raw)
+
+    X_test_t = torch.tensor(X_test, dtype=torch.float32)
 
     # Generate test predictions using the optimized temperature
     with torch.no_grad():
-        raw_logits_test = []
-        for i in range(len(X_test_t)):
-            xi = X_test_t[i]
-            z  = vqc_model.vqc(xi)
-            raw_logits_test.append((z + vqc_model.bias).item())
-    logits_test = torch.tensor(raw_logits_test)
+        out_test = torch.stack([vqc_model.vqc(X_test_t[i]) for i in range(len(X_test_t))])
+        logits_test = (out_test + vqc_model.bias).view(-1)
     logits_test_scaled = logits_test / T_opt
     probs_scaled = torch.sigmoid(logits_test_scaled).numpy()
 
-    return T_opt, probs_scaled, logits_test_scaled
+    return T_opt, probs_scaled, logits_test_scaled.numpy()
 
 
 def plot_calibration_comparison(y_true, probs_before, probs_after,
@@ -935,10 +943,10 @@ def main():
     X_val_scaled = scaler_fit.transform(X_val_pca)
 
     T_opt, probs_scaled, logits_scaled = temperature_scale_vqc(
-        vqc_model, X_val_scaled, y_val)
+        vqc_model, X_val_scaled, y_val, X_test=X_test_q)
     ece_before = expected_calibration_error(y_test, vqc_probs)
     ece_after  = expected_calibration_error(y_test, probs_scaled)
-    auc_scaled = roc_auc_score(y_test, logits_scaled)
+    auc_scaled = roc_auc_score(y_test, probs_scaled)
     aupr_scaled = average_precision_score(y_test, probs_scaled) if len(set(y_test)) > 1 else 0.0
     print(f"  Optimal T     : {T_opt:.4f}  "
           f"({'overconfident → softened' if T_opt > 1 else 'underconfident → sharpened'})")

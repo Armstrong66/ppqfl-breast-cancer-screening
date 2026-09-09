@@ -81,18 +81,34 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def auto_detect_best_vqc_config(ckpt_dir: Path) -> tuple:
-    # Priority 0: finalist_configs.json
+    # Priority 0: finalist_configs.json (supports both dict schema and flat list schema)
     finalists_file = ckpt_dir.parent / "finalist_configs.json"
     if finalists_file.exists():
         try:
             with open(finalists_file) as f:
-                finalists = json.load(f)
-            if finalists:
-                primary = finalists[0]
-                return (int(primary.get("n_qubits", 4)),
-                        int(primary.get("n_layers", 2)),
-                        float(primary.get("lr", 0.01)),
-                        bool(primary.get("reupload", True)))
+                finalists_data = json.load(f)
+            primary = None
+            if isinstance(finalists_data, dict):
+                perf_list = finalists_data.get("performance_finalists", [])
+                if perf_list:
+                    primary = perf_list[0]
+                else:
+                    eff_list = finalists_data.get("efficiency_finalists", [])
+                    if eff_list:
+                        primary = eff_list[0]
+            elif isinstance(finalists_data, list) and len(finalists_data) > 0:
+                primary = finalists_data[0]
+
+            if primary:
+                cfg_q = int(primary.get("n_qubits", 4))
+                cfg_l = int(primary.get("n_layers", 2))
+                cfg_lr = float(primary.get("lr", 0.01))
+                reupload = bool(primary.get("reupload", True))
+                if "no reupload" in primary.get("notes", "").lower() or "noreupload" in primary.get("name", "").lower():
+                    reupload = False
+                print(f"  Auto-detect: loaded from finalist_configs.json → "
+                      f"q={cfg_q} l={cfg_l} lr={cfg_lr} reupload={reupload}")
+                return cfg_q, cfg_l, cfg_lr, reupload
         except Exception:
             pass
 
@@ -426,6 +442,22 @@ def compute_comprehensive_metrics(y_true, probs, opt_threshold: Optional[float] 
         y_true, preds_opt, target_names=["Benign", "Malignant"], output_dict=True
     ) if n_classes > 1 else {}
 
+    # Priority 1: Collapsed-classifier diagnostic & polarity check
+    if n_classes > 1:
+        sens_05 = float(report_05.get("Malignant", {}).get("recall", 0.0))
+        spec_05 = float(report_05.get("Benign", {}).get("recall", 0.0))
+        sens_opt = float(report_opt.get("Malignant", {}).get("recall", 0.0))
+        spec_opt = float(report_opt.get("Benign", {}).get("recall", 0.0))
+
+        if (sens_05 >= 0.999 and spec_05 <= 0.001) or (sens_05 <= 0.001 and spec_05 >= 0.999):
+            print(f"    [WARNING] Collapsed classifier detected at τ=0.5: sensitivity={sens_05:.4f}, specificity={spec_05:.4f} (trivial single-class predictor)")
+        if (sens_opt >= 0.999 and spec_opt <= 0.001) or (sens_opt <= 0.001 and spec_opt >= 0.999):
+            print(f"    [WARNING] Collapsed classifier detected at τ*={tau:.4f}: sensitivity={sens_opt:.4f}, specificity={spec_opt:.4f} (trivial single-class predictor)")
+
+        if auc < 0.5:
+            inv_auc = roc_auc_score(y_true, 1.0 - probs)
+            print(f"    [DIAGNOSTIC] Sub-chance AUC detected ({auc:.4f} < 0.50). Inverted AUC (1 - probs) would be {inv_auc:.4f}. Check label/feature orientation.")
+
     # 1,000-resample 95% Bootstrap CIs
     ci_dict = compute_bootstrap_ci(y_true, probs, tau, n_bootstraps=1000)
 
@@ -728,11 +760,50 @@ def build_master_ablation(
       KAU_AUC | KAU_F1 | GeneralisationGap | Notes
     """
     rows = []
+    matched_kau_keys = set()
+
+    def find_kau_entry(model_name: str = "", nq: Optional[int] = None, nl: Optional[int] = None) -> dict:
+        if not kau_results_dict:
+            return {}
+        if model_name in kau_results_dict:
+            matched_kau_keys.add(model_name)
+            return kau_results_dict[model_name]
+        
+        if nq is not None and nl is not None:
+            for k, v in kau_results_dict.items():
+                if f"q={nq}" in k and f"l={nl}" in k and "regime b" not in k.lower():
+                    matched_kau_keys.add(k)
+                    return v
+        
+        m_lower = model_name.lower()
+        if "classical" in m_lower and "control" not in m_lower and "micro" not in m_lower:
+            for k, v in kau_results_dict.items():
+                if "classical" in k.lower() and "micro" not in k.lower():
+                    matched_kau_keys.add(k)
+                    return v
+        elif "micro-mlp" in m_lower or "micromlp" in m_lower:
+            target_dim = nq if nq is not None else N_QUBITS
+            for k, v in kau_results_dict.items():
+                if "micro" in k.lower() and (f"dim={target_dim}" in k or f"dim={N_QUBITS}" in k):
+                    matched_kau_keys.add(k)
+                    return v
+            for k, v in kau_results_dict.items():
+                if "micro" in k.lower():
+                    matched_kau_keys.add(k)
+                    return v
+        elif "qfl" in m_lower or "federated" in m_lower:
+            for k, v in kau_results_dict.items():
+                if "qfl" in k.lower() or "federated" in k.lower():
+                    matched_kau_keys.add(k)
+                    return v
+        
+        return {}
 
     # ── 1. Classical baseline ─────────────────────────────────────────────
     if baseline_json.exists():
         with open(baseline_json) as f:
             bl = json.load(f)
+        c_res = find_kau_entry("Classical")
         rows.append({
             "Model":            bl.get("backbone", "MobileNetV2"),
             "ModelShort":       "Classical",
@@ -743,14 +814,14 @@ def build_master_ablation(
             "NoiseSigma":       0.0, "DPSigma": 0.0,
             "MendeleyTestAUC":  bl.get("test_auc_roc", "N/A"),
             "MendeleyTestF1":   bl.get("test_f1", "N/A"),
-            "KAU_AUC":          kau_results_dict.get("Classical", {}).get("auc", "N/A"),
-            "KAU_F1":           kau_results_dict.get("Classical", {}).get("f1", "N/A"),
+            "KAU_AUC":          c_res.get("auc", "N/A"),
+            "KAU_F1":           c_res.get("f1", "N/A"),
             "Notes":            "Classical baseline (frozen CNN backbone)",
         })
 
     # ── 1b. Classical Micro-MLP / Control ──────────────────────────────────
-    if "Micro-MLP" in kau_results_dict:
-        m_res = kau_results_dict["Micro-MLP"]
+    m_res = find_kau_entry("Micro-MLP", nq=N_QUBITS)
+    if m_res:
         rows.append({
             "Model":            f"Micro-MLP (dim={N_QUBITS})",
             "ModelShort":       "Micro-MLP",
@@ -783,6 +854,7 @@ def build_master_ablation(
                 continue  # keep first (best val AUC) only
             seen_regime_A.add(key)
             label = f"HQCNN q={nq} l={nl}"
+            k_entry = find_kau_entry(label, nq=nq, nl=nl)
             rows.append({
                 "Model":           label,
                 "ModelShort":      f"VQC-q{nq}l{nl}-A",
@@ -793,8 +865,8 @@ def build_master_ablation(
                 "NoiseSigma":      0.0, "DPSigma": 0.0,
                 "MendeleyTestAUC": r.get("TestAUC", "N/A"),
                 "MendeleyTestF1":  r.get("TestF1",  "N/A"),
-                "KAU_AUC":         kau_results_dict.get(label, {}).get("auc", "N/A"),
-                "KAU_F1":          kau_results_dict.get(label, {}).get("f1", "N/A"),
+                "KAU_AUC":         k_entry.get("auc", "N/A"),
+                "KAU_F1":          k_entry.get("f1", "N/A"),
                 "Notes":           "Regime A primary",
             })
         
@@ -805,6 +877,7 @@ def build_master_ablation(
             # Avoid duplicate Micro-MLP rows
             if "micro-mlp" in m_name.lower():
                 continue
+            ctrl_k = find_kau_entry(m_name)
             rows.append({
                 "Model":           m_name,
                 "ModelShort":      m_name[:15],
@@ -817,8 +890,8 @@ def build_master_ablation(
                 "DPSigma":         0.0,
                 "MendeleyTestAUC": r.get("TestAUC", "N/A"),
                 "MendeleyTestF1":  r.get("TestF1",  "N/A"),
-                "KAU_AUC":         kau_results_dict.get(m_name, {}).get("auc", "N/A"),
-                "KAU_F1":          kau_results_dict.get(m_name, {}).get("f1", "N/A"),
+                "KAU_AUC":         ctrl_k.get("auc", "N/A"),
+                "KAU_F1":          ctrl_k.get("f1", "N/A"),
                 "Notes":           str(r.get("Notes", "Classical control baseline")),
             })
     else:
@@ -837,6 +910,7 @@ def build_master_ablation(
             seen_regime_A.add(key)
             df_h  = pd.read_csv(hist_csv)
             label = f"HQCNN q={nq} l={nl}"
+            k_entry = find_kau_entry(label, nq=nq, nl=nl)
             rows.append({
                 "Model":           label,
                 "ModelShort":      f"VQC-q{nq}l{nl}-A",
@@ -847,8 +921,8 @@ def build_master_ablation(
                 "NoiseSigma":      0.0, "DPSigma": 0.0,
                 "MendeleyTestAUC": "N/A",
                 "MendeleyTestF1":  "N/A",
-                "KAU_AUC":         kau_results_dict.get(label, {}).get("auc", "N/A"),
-                "KAU_F1":          kau_results_dict.get(label, {}).get("f1", "N/A"),
+                "KAU_AUC":         k_entry.get("auc", "N/A"),
+                "KAU_F1":          k_entry.get("f1", "N/A"),
                 "Notes":           f"Regime A, lr={lr}",
             })
 
@@ -868,6 +942,7 @@ def build_master_ablation(
         df_h  = pd.read_csv(hist_csv)
         best_auc = df_h["val_auc"].max() if "val_auc" in df_h.columns else "N/A"
         label = f"HQCNN q={nq} l={nl} (Regime B)"
+        b_entry = find_kau_entry(label, nq=nq, nl=nl)
         rows.append({
             "Model":           label,
             "ModelShort":      f"VQC-q{nq}l{nl}-B",
@@ -878,8 +953,8 @@ def build_master_ablation(
             "NoiseSigma":      0.0, "DPSigma": 0.0,
             "MendeleyTestAUC": "N/A",
             "MendeleyTestF1":  "N/A",
-            "KAU_AUC":         kau_results_dict.get(label, {}).get("auc", "N/A"),
-            "KAU_F1":          kau_results_dict.get(label, {}).get("f1", "N/A"),
+            "KAU_AUC":         b_entry.get("auc", "N/A"),
+            "KAU_F1":          b_entry.get("f1", "N/A"),
             "Notes":           f"Regime B, best val AUC={best_auc:.4f}" if isinstance(best_auc, float) else "Regime B",
         })
 
@@ -896,8 +971,10 @@ def build_master_ablation(
                 best_sweep = sweep_rows.loc[sweep_rows.groupby("Qubits")["TestAUC_f"].idxmax()]
                 for _, r in best_sweep.iterrows():
                     nq = int(r["Qubits"]); nl = int(r["Layers"])
+                    sw_label = f"HQCNN q={nq} l={nl} (sweep best)"
+                    sw_entry = find_kau_entry(sw_label, nq=nq, nl=nl)
                     rows.append({
-                        "Model":           f"HQCNN q={nq} l={nl} (sweep best)",
+                        "Model":           sw_label,
                         "ModelShort":      f"VQC-q{nq}l{nl}-sweep",
                         "Category":        "HQCNN Sweep",
                         "Regime":          "A — sweep (best per qubit count)",
@@ -905,8 +982,9 @@ def build_master_ablation(
                         "TrainableParams": nq * nl + 1,
                         "NoiseSigma":      0.0, "DPSigma": 0.0,
                         "MendeleyTestAUC": r.get("TestAUC", "N/A"),
-                        "MendeleyTestF1":  r.get("TestF1", "N/A"),
-                        "KAU_AUC":         "N/A", "KAU_F1": "N/A",
+                        "MendeleyTestF1":  r.get("TestF1",  "N/A"),
+                        "KAU_AUC":         sw_entry.get("auc", "N/A"),
+                        "KAU_F1":          sw_entry.get("f1", "N/A"),
                         "Notes":           "Best sweep config per qubit count",
                     })
             except Exception:
@@ -955,6 +1033,7 @@ def build_master_ablation(
             "Notes":           "Centralised VQC; same gradient steps as QFL",
         })
         # QFL no-DP row
+        qfl_entry = find_kau_entry("QFL (Federated)")
         rows.append({
             "Model":           "QFL (σ_dp=0, no DP)",
             "ModelShort":      "QFL",
@@ -965,8 +1044,8 @@ def build_master_ablation(
             "NoiseSigma":      0.0, "DPSigma": 0.0,
             "MendeleyTestAUC": ua.get("federated_test_auc", "N/A"),
             "MendeleyTestF1":  ua.get("federated_test_f1", "N/A"),
-            "KAU_AUC":         kau_results_dict.get("QFL", {}).get("auc", "N/A"),
-            "KAU_F1":          kau_results_dict.get("QFL", {}).get("f1", "N/A"),
+            "KAU_AUC":         qfl_entry.get("auc", "N/A"),
+            "KAU_F1":          qfl_entry.get("f1", "N/A"),
             "Notes":           f"Utility gap vs centralised: {ua.get('auc_utility_gap','N/A')}",
         })
         # DP sweep rows
@@ -990,7 +1069,7 @@ def build_master_ablation(
     # ── 5. Add any remaining capacity spectrum models evaluated in kau_results_dict ──
     existing_model_names = {r["Model"] for r in rows}
     for label, k_res in kau_results_dict.items():
-        if label not in existing_model_names and not any(r["Model"] == label for r in rows):
+        if label not in matched_kau_keys and label not in existing_model_names and not any(r["Model"] == label for r in rows):
             m_auc = k_res.get("mendeley_auc", "N/A")
             m_f1  = k_res.get("mendeley_f1", "N/A")
             k_auc = k_res.get("auc", "N/A")
@@ -1135,7 +1214,7 @@ def write_summary_report(master_df: pd.DataFrame, shift_metrics: dict, save_path
         "# Executive Summary: Cross-Population External Validation & Generalisation Analysis",
         "",
         "## 1. Study Overview & Cohorts",
-        "- **Primary Cohort**: Mendeley Breast Ultrasound Dataset (Polokwane, South Africa)",
+        "- **Primary Cohort**: Mendeley Breast Cancer Mammography Dataset (Polokwane, South Africa)",
         "- **External Validation Cohort**: King Abdulaziz University Breast Cancer Mammography Dataset (KAU-BCMD, Saudi Arabia / MENA)",
         "",
         "## 2. Cross-Population Performance & Capacity Spectrum",
@@ -1162,10 +1241,30 @@ def write_summary_report(master_df: pd.DataFrame, shift_metrics: dict, save_path
         lines.append(f"- **Interpretation**: {shift_metrics.get('interpretation', 'N/A')}")
         lines.append("")
 
-    lines.append("## 4. Key Takeaways & Clinical Recommendations")
-    lines.append("1. **Generalisation Capacity**: Compact VQC circuits exhibit competitive cross-population generalisation despite substantial feature-space distribution shift.")
-    lines.append("2. **Threshold Calibration**: Recalibrating decision thresholds via Youden's index on validation data significantly recovers sensitivity on the external cohort.")
-    lines.append("3. **Privacy & Communication**: PPQFL shares strictly variational quantum circuit parameters (<= 20 scalar parameters per client update), eliminating raw mammogram transmission while maintaining cross-cohort screening utility.")
+    lines.append("## 4. Key Summary Statistics & Empirical Findings")
+    if isinstance(master_df, pd.DataFrame) and not master_df.empty and "KAU_AUC" in master_df.columns:
+        valid_kau = master_df[master_df["KAU_AUC"].apply(
+            lambda x: isinstance(x, (int, float)) or (isinstance(x, str) and x.replace(".", "").isdigit())
+        )].copy()
+        if not valid_kau.empty:
+            valid_kau["KAU_AUC_f"] = pd.to_numeric(valid_kau["KAU_AUC"])
+            best_kau_row = valid_kau.loc[valid_kau["KAU_AUC_f"].idxmax()]
+            lines.append(f"1. **Peak External Validation**: Highest KAU-BCMD AUC is `{best_kau_row['KAU_AUC_f']:.4f}` achieved by `{best_kau_row['Model']}` ({best_kau_row.get('TrainableParams', 'N/A')} parameters).")
+
+        valid_gap = master_df[master_df["GeneralisationGap"].apply(
+            lambda x: isinstance(x, (int, float)) or (isinstance(x, str) and x.replace(".", "").replace("-", "").replace("+", "").isdigit())
+        )].copy()
+        if not valid_gap.empty:
+            valid_gap["Gap_f"] = pd.to_numeric(valid_gap["GeneralisationGap"])
+            min_gap_row = valid_gap.loc[valid_gap["Gap_f"].abs().idxmin()]
+            lines.append(f"2. **Minimal Generalisation Gap**: Lowest absolute generalisation gap is `{min_gap_row['Gap_f']:.4f}` ({min_gap_row['Model']}).")
+
+    if isinstance(shift_metrics, dict):
+        mean_js = shift_metrics.get('mean_js_divergence', 'N/A')
+        sig_dims = shift_metrics.get('n_dims_significant_shift', 'N/A')
+        lines.append(f"3. **Domain Shift**: Mean JS divergence is `{mean_js}` with `{sig_dims}` dimensions exhibiting statistically significant shift (p < 0.05).")
+
+    lines.append("4. **Parameter Footprint**: Quantum models utilize <= 20 parameters compared to 164,226 parameters in the classical CNN baseline.")
     lines.append("")
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1399,17 +1498,56 @@ def main():
             kau_results[lbl]["mendeley_auc"] = mendeley_results[lbl]["auc"]
             kau_results[lbl]["mendeley_f1"] = mendeley_results[lbl]["f1"]
 
-    # 3. Curated Spectrum of VQC Models (Low Floor to Upper Bound)
-    vqc_spectrum = [
-        (4, 1, 0.01, "HQCNN q=4 l=1 (Minimal Floor, 5p)"),
-        (4, 2, 0.01, "HQCNN q=4 l=2 (Standard 4Q, 9p)"),
-        (4, 3, 0.01, "HQCNN q=4 l=3 (Deep 4Q, 13p)"),
-        (6, 2, 0.01, "HQCNN q=6 l=2 (Primary Sweep Best, 13p)"),
-        (8, 1, 0.01, "HQCNN q=8 l=1 (Wide Floor, 9p)"),
-        (8, 2, 0.01, "HQCNN q=8 l=2 (Wide Standard, 17p)"),
-    ]
+    # 3. Dynamic Spectrum of VQC Models (Performance + Efficiency Finalists)
+    finalists_path = VQC_DIR_A.parent / "finalist_configs.json"
+    vqc_spectrum = []
+    seen_configs = set()
+    if finalists_path.exists():
+        try:
+            with open(finalists_path) as f:
+                fdata = json.load(f)
+            combined = []
+            if isinstance(fdata, dict):
+                p_list = fdata.get("performance_finalists", [])
+                e_list = fdata.get("efficiency_finalists", [])
+                for item in p_list:
+                    combined.append((item, "Performance Finalist"))
+                for item in e_list:
+                    combined.append((item, "Efficiency Finalist"))
+            elif isinstance(fdata, list):
+                for item in fdata:
+                    combined.append((item, "Finalist"))
+            
+            for item, category in combined:
+                nq = int(item.get("n_qubits", 4))
+                nl = int(item.get("n_layers", 2))
+                lr = float(item.get("lr", 0.01))
+                reup = bool(item.get("reupload", True))
+                if "no reupload" in item.get("notes", "").lower() or "noreupload" in item.get("name", "").lower():
+                    reup = False
+                n_params = int(item.get("vqc_params", nq * nl + 1))
+                cfg_key = (nq, nl, reup)
+                if cfg_key in seen_configs:
+                    continue
+                seen_configs.add(cfg_key)
+                lbl = f"HQCNN q={nq} l={nl} ({category}, {n_params}p)"
+                vqc_spectrum.append((nq, nl, lr, reup, lbl))
+        except Exception as e:
+            print(f"  [WARN] Error loading finalist_configs.json: {e}")
 
-    for nq, nl, lr, lbl in vqc_spectrum:
+    if not vqc_spectrum:
+        # Fallback default spectrum
+        vqc_spectrum = [
+            (4, 1, 0.01, True, "HQCNN q=4 l=1 (Minimal Floor, 5p)"),
+            (4, 2, 0.01, True, "HQCNN q=4 l=2 (Standard 4Q, 9p)"),
+            (4, 3, 0.01, True, "HQCNN q=4 l=3 (Deep 4Q, 13p)"),
+            (6, 2, 0.01, True, "HQCNN q=6 l=2 (Standard 6Q, 13p)"),
+            (6, 3, 0.01, True, "HQCNN q=6 l=3 (Deep 6Q, 19p)"),
+            (8, 1, 0.01, True, "HQCNN q=8 l=1 (Wide Floor, 9p)"),
+            (8, 2, 0.01, True, "HQCNN q=8 l=2 (Wide Standard, 17p)"),
+        ]
+
+    for nq, nl, lr, reup_v, lbl in vqc_spectrum:
         f_tr_pca = FEAT_DIR / f"features_train_pca{nq}.npy"
         f_va_pca = FEAT_DIR / f"features_val_pca{nq}.npy"
         f_te_pca = FEAT_DIR / f"features_test_pca{nq}.npy"
@@ -1421,7 +1559,6 @@ def main():
             sc = MinMaxScaler(feature_range=(0, 1)).fit(X_tr_p)
             X_tr_s, X_va_s, X_te_s, X_ka_s = sc.transform(X_tr_p), sc.transform(X_va_p), sc.transform(X_te_p), sc.transform(X_ka_p)
 
-            reup_v = VQC_REUPLOAD if (nq == N_QUBITS and nl == N_LAYERS) else True
             vqc_m = load_or_train_vqc(nq, nl, lr, X_tr_s, y_train_arr, X_va_s, y_val, reupload=reup_v)
             vqc_v = evaluate_vqc_on_kau(vqc_m, X_va_s, y_val)
             tau_v = vqc_v["opt_threshold"]
@@ -1433,7 +1570,8 @@ def main():
 
     # 4. QFL Global Model
     if vqc_qfl is not None:
-        print(f"  [4] QFL Global Model (Federated q={N_QUBITS} l={N_LAYERS}, 13p)...")
+        qfl_p = N_QUBITS * N_LAYERS + 1
+        print(f"  [4] QFL Global Model (Federated q={N_QUBITS} l={N_LAYERS}, {qfl_p}p)...")
         qfl_val_eval = evaluate_vqc_on_kau(vqc_qfl, X_val_scaled, y_val)
         tau_qfl = qfl_val_eval["opt_threshold"]
         print(f"      Validation optimal threshold τ*={tau_qfl:.4f}")
@@ -1445,9 +1583,13 @@ def main():
     # ── Statistical Significance Tests ────────────────────────────────────
     print("\n  ── Running Statistical Significance Hypothesis Tests ──")
     stat_tests = {}
-    primary_vqc_label = f"HQCNN q={N_QUBITS} l={N_LAYERS} (Primary Sweep Best, 13p)"
-    if primary_vqc_label not in kau_results:
-        matching = [k for k in kau_results if f"q={N_QUBITS}" in k]
+    primary_vqc_label = None
+    for k in kau_results:
+        if f"q={N_QUBITS}" in k and f"l={N_LAYERS}" in k and "qfl" not in k.lower():
+            primary_vqc_label = k
+            break
+    if primary_vqc_label is None:
+        matching = [k for k in kau_results if f"q={N_QUBITS}" in k and "qfl" not in k.lower()]
         primary_vqc_label = matching[0] if matching else list(kau_results.keys())[0]
 
     vqc_kau_probs = kau_results[primary_vqc_label]["probs"]

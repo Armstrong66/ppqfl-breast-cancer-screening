@@ -56,13 +56,13 @@ Thumbs.db
 *.swp
 *.swo
 
-# ── Sensitive / local config ─────────────────────────────────────────────────
+# ── Sensitive / local config & private docs ─────────────────────────────────
 .env
 secrets.yaml
 *_private*
 PPQFL_journal_rigor_plan_v2.md
+PPQFL_bugfix_and_finalist_redesign.md
 fix_these_asap.md
 
 # ── Miscellaneous ─────────────────────────────────────────────
 run_commands.txt
-fix_these_asap.md

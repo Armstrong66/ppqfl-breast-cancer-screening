@@ -514,6 +514,11 @@ def validate_pca_with_linear_probe(features_train_pca: dict, labels_train: np.nd
     for n in PCA_N_COMPONENTS:
         X_tr = features_train_pca[n]
         X_vl = features_val_pca[n]
+        # Priority 5: confirm fresh arrays and distinct dimensions per iteration
+        tr_hash = hash(X_tr.tobytes()[:500]) if hasattr(X_tr, "tobytes") else "N/A"
+        vl_hash = hash(X_vl.tobytes()[:500]) if hasattr(X_vl, "tobytes") else "N/A"
+        print(f"    [Diagnostic] PCA n={n}: X_tr shape={X_tr.shape}, id={id(X_tr)}, hash={tr_hash}; "
+              f"X_vl shape={X_vl.shape}, id={id(X_vl)}, hash={vl_hash}")
         lr   = LogisticRegression(max_iter=1000, random_state=42, C=1.0)
         lr.fit(X_tr, labels_train)
         val_probs = lr.predict_proba(X_vl)[:, 1]
