@@ -48,7 +48,7 @@ Prerequisites: _3_5_vqc.py must have been run (Regime A checkpoint needed)
 """
 
 # ── Imports ────────────────────────────────────────────────────────────────
-import json, pickle, warnings
+import json, pickle, warnings, shutil
 from pathlib import Path
 from copy import deepcopy
 from typing import Optional, Tuple, List, Dict, Union, Any
@@ -120,6 +120,8 @@ def auto_detect_best_vqc_config(ckpt_dir: Path) -> tuple:
                 cfg_l  = int(primary["n_layers"])
                 cfg_lr = float(primary["lr"])
                 reupload = bool(primary.get("reupload", True))
+                if "no reupload" in primary.get("notes", "").lower() or "noreupload" in primary.get("name", "").lower():
+                    reupload = False
                 print(f"  Auto-detect: loaded from finalist_configs.json → "
                       f"q={cfg_q} l={cfg_l} lr={cfg_lr} reupload={reupload}")
                 return cfg_q, cfg_l, cfg_lr, reupload
@@ -275,34 +277,102 @@ class HQCNNClassifier(nn.Module):
         return prob
 
 
+def find_vqc_checkpoint(vqc_dir: Path, n_qubits: int, n_layers: int, lr: float, reupload: bool = True) -> Optional[Path]:
+    """
+    Robustly search for a VQC checkpoint across regime_A, reupload_ablation, sweep, regime_B,
+    and the vqc_outputs root.
+    If found outside regime_A, automatically mirrors the checkpoint into regime_A so that
+    downstream stages and evaluations always find it in the canonical location.
+    """
+    vqc_dir = Path(vqc_dir)
+    vqc_base = vqc_dir.parent if vqc_dir.name in ("regime_A", "regime_B", "sweep", "reupload_ablation", "noise") else vqc_dir
+    regime_a_dir = vqc_base / "regime_A"
+    regime_a_dir.mkdir(parents=True, exist_ok=True)
+
+    search_dirs = [
+        regime_a_dir,
+        vqc_base / "reupload_ablation",
+        vqc_base / "sweep",
+        vqc_base / "regime_B",
+        vqc_base,
+    ]
+
+    suffix = "" if reupload else "_noreupload"
+    exact_name = f"vqc_q{n_qubits}_l{n_layers}_lr{lr}{suffix}.pt"
+    generic_name = f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt"
+
+    def _sync_and_return(src: Path) -> Path:
+        if src.parent.resolve() != regime_a_dir.resolve():
+            dest = regime_a_dir / src.name
+            try:
+                if not dest.exists():
+                    shutil.copy2(src, dest)
+                    print(f"  [Auto-sync] Mirrored checkpoint to: {dest}")
+                if "_noreupload" in src.name:
+                    gen_dest = regime_a_dir / generic_name
+                    if not gen_dest.exists():
+                        shutil.copy2(src, gen_dest)
+            except Exception:
+                pass
+        return src
+
+    # 1. Exact name match across search directories
+    for d in search_dirs:
+        p = d / exact_name
+        if p.exists():
+            return _sync_and_return(p)
+
+    # 2. Generic name match across search directories
+    for d in search_dirs:
+        p = d / generic_name
+        if p.exists():
+            return _sync_and_return(p)
+
+    # 3. Pattern match in each search directory
+    for d in search_dirs:
+        if not d.exists():
+            continue
+        if not reupload:
+            matches = sorted(d.glob(f"vqc_q{n_qubits}_l{n_layers}_*noreupload*.pt"))
+            if matches:
+                return _sync_and_return(max(matches, key=lambda f: f.stat().st_mtime))
+        matches = sorted(d.glob(f"vqc_q{n_qubits}_l{n_layers}_lr{lr}*.pt"))
+        if matches:
+            return _sync_and_return(max(matches, key=lambda f: f.stat().st_mtime))
+
+    # 4. Recursive search across entire vqc_base
+    if vqc_base.exists():
+        if not reupload:
+            matches = sorted(vqc_base.rglob(f"vqc_q{n_qubits}_l{n_layers}_*noreupload*.pt"))
+            if matches:
+                return _sync_and_return(max(matches, key=lambda f: f.stat().st_mtime))
+        matches = sorted(vqc_base.rglob(f"vqc_q{n_qubits}_l{n_layers}_lr{lr}*.pt"))
+        if matches:
+            return _sync_and_return(max(matches, key=lambda f: f.stat().st_mtime))
+        matches = sorted(vqc_base.rglob(f"vqc_q{n_qubits}_l{n_layers}*.pt"))
+        if matches:
+            return _sync_and_return(max(matches, key=lambda f: f.stat().st_mtime))
+
+    return None
+
+
 def load_vqc_checkpoint(n_qubits, n_layers, lr,
                         shot_based=False, n_shots=100,
                         reupload=True) -> HQCNNClassifier:
-    """Reconstruct HQCNNClassifier and load saved weights from regime_A.
-    Searches for reupload-specific checkpoint name first, then generic name.
+    """Reconstruct HQCNNClassifier and load saved weights.
+    Searches across regime_A, reupload_ablation, sweep, and outputs/vqc_outputs.
     """
     model = HQCNNClassifier(n_qubits, n_layers,
                             shot_based=shot_based, n_shots=n_shots,
                             reupload=reupload)
-    regime_dir = VQC_CKPT_DIR / "regime_A"
-
-    # Try reupload-specific name first, then generic
-    suffix    = "" if reupload else "_noreupload"
-    ckpt_name = f"vqc_q{n_qubits}_l{n_layers}_lr{lr}{suffix}.pt"
-    ckpt_path = regime_dir / ckpt_name
-    if not ckpt_path.exists():
-        # Fall back to unsuffixed name (older checkpoints or single-run format)
-        ckpt_path = regime_dir / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt"
-    if not ckpt_path.exists():
-        # Last resort: any checkpoint matching q/l
-        alts = sorted(regime_dir.glob(f"vqc_q{n_qubits}_l{n_layers}_lr{lr}*.pt"))
-        if alts:
-            ckpt_path = alts[0]
-        else:
-            raise FileNotFoundError(
-                f"VQC checkpoint not found: {regime_dir / ckpt_name}\n"
-                "Run 3_5_vqc.py → run_regime_A() first."
-            )
+    ckpt_path = find_vqc_checkpoint(VQC_CKPT_DIR, n_qubits, n_layers, lr, reupload=reupload)
+    if ckpt_path is None or not ckpt_path.exists():
+        suffix = "" if reupload else "_noreupload"
+        expected = f"vqc_q{n_qubits}_l{n_layers}_lr{lr}{suffix}.pt"
+        raise FileNotFoundError(
+            f"VQC checkpoint '{expected}' not found in {VQC_CKPT_DIR} or any subdirectories.\n"
+            "Please ensure _3_5_vqc.py has run."
+        )
 
     state = torch.load(ckpt_path, map_location="cpu")
     # Load via a temporary model with the same ansatz to safely copy weights
@@ -662,18 +732,13 @@ def compare_regimes_uncertainty(y_test: np.ndarray):
         ("A", VQC_CKPT_DIR / "regime_A", "Frozen Classical + VQC"),
         ("B", VQC_CKPT_DIR / "regime_B", "End-to-End (Proj + VQC)"),
     ]:
-        ckpt = ckpt_dir / f"vqc_q{VQC_N_QUBITS}_l{VQC_N_LAYERS}_lr{VQC_LR}.pt"
-        if not ckpt.exists():
-            # Try reupload-specific suffix, then any matching checkpoint
-            suffix = "" if VQC_REUPLOAD else "_noreupload"
-            ckpt = ckpt_dir / f"vqc_q{VQC_N_QUBITS}_l{VQC_N_LAYERS}_lr{VQC_LR}{suffix}.pt"
-        if not ckpt.exists():
-            alts = sorted(ckpt_dir.glob(f"vqc_q{VQC_N_QUBITS}_l{VQC_N_LAYERS}_*.pt"))
-            if alts:
-                ckpt = alts[0]
-            else:
-                print(f"  [SKIP] No checkpoint for Regime {regime}: {ckpt_dir}")
-                continue
+        if regime == "A":
+            ckpt = find_vqc_checkpoint(VQC_CKPT_DIR, VQC_N_QUBITS, VQC_N_LAYERS, VQC_LR, reupload=VQC_REUPLOAD)
+        else:
+            ckpt = find_vqc_checkpoint(ckpt_dir, VQC_N_QUBITS, VQC_N_LAYERS, VQC_LR, reupload=True)
+        if ckpt is None or not ckpt.exists():
+            print(f"  [SKIP] No checkpoint for Regime {regime}: {ckpt_dir}")
+            continue
 
         model = HQCNNClassifier(VQC_N_QUBITS, VQC_N_LAYERS, shot_based=False, reupload=VQC_REUPLOAD)
         state = torch.load(ckpt, map_location="cpu")

@@ -48,7 +48,7 @@ Prerequisites:
 """
 
 # ── Imports ────────────────────────────────────────────────────────────────
-import json, warnings, copy, re
+import json, warnings, copy, re, shutil
 from pathlib import Path
 from collections import OrderedDict
 from typing import Dict, List, Tuple, Optional
@@ -255,20 +255,75 @@ class VQCModel(nn.Module):
 
 
 def find_best_vqc_checkpoint(ckpt_dir: Path, n_qubits: int, n_layers: int, lr: float, reupload: bool = True) -> Optional[Path]:
-    suffix = "" if reupload else "_noreupload"
-    exact_specific = ckpt_dir / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}{suffix}.pt"
-    if exact_specific.exists():
-        return exact_specific
-    exact = ckpt_dir / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt"
-    if exact.exists():
-        return exact
+    ckpt_dir = Path(ckpt_dir)
+    vqc_base = ckpt_dir.parent if ckpt_dir.name in ("regime_A", "regime_B", "sweep", "reupload_ablation", "noise") else ckpt_dir
+    regime_a_dir = vqc_base / "regime_A"
+    regime_a_dir.mkdir(parents=True, exist_ok=True)
 
-    candidates = sorted(ckpt_dir.glob(f"vqc_q{n_qubits}_l{n_layers}_lr*.pt"))
-    if candidates:
-        fallback = max(candidates, key=lambda p: p.stat().st_mtime)
-        print(f"  [WARN] Exact warm-start checkpoint not found: {exact.name}")
-        print(f"  [WARN] Falling back to latest matching checkpoint: {fallback.name}")
-        return fallback
+    search_dirs = [
+        regime_a_dir,
+        vqc_base / "reupload_ablation",
+        vqc_base / "sweep",
+        vqc_base / "regime_B",
+        vqc_base,
+    ]
+
+    suffix = "" if reupload else "_noreupload"
+    exact_specific = f"vqc_q{n_qubits}_l{n_layers}_lr{lr}{suffix}.pt"
+    exact_generic = f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt"
+
+    def _sync_and_return(src: Path) -> Path:
+        if src.parent.resolve() != regime_a_dir.resolve():
+            dest = regime_a_dir / src.name
+            try:
+                if not dest.exists():
+                    shutil.copy2(src, dest)
+                    print(f"  [Auto-sync] Mirrored checkpoint to: {dest}")
+                if "_noreupload" in src.name:
+                    gen_dest = regime_a_dir / exact_generic
+                    if not gen_dest.exists():
+                        shutil.copy2(src, gen_dest)
+            except Exception:
+                pass
+        return src
+
+    # 1. Exact match with expected suffix across subdirs
+    for d in search_dirs:
+        p = d / exact_specific
+        if p.exists():
+            return _sync_and_return(p)
+
+    # 2. Generic match across subdirs
+    for d in search_dirs:
+        p = d / exact_generic
+        if p.exists():
+            return _sync_and_return(p)
+
+    # 3. Matching pattern across search dirs
+    for d in search_dirs:
+        if not d.exists():
+            continue
+        if not reupload:
+            alts = sorted(d.glob(f"vqc_q{n_qubits}_l{n_layers}_*noreupload*.pt"))
+            if alts:
+                return _sync_and_return(max(alts, key=lambda f: f.stat().st_mtime))
+        alts = sorted(d.glob(f"vqc_q{n_qubits}_l{n_layers}_lr*.pt"))
+        if alts:
+            return _sync_and_return(max(alts, key=lambda f: f.stat().st_mtime))
+
+    # 4. Recursive search across entire vqc_base
+    if vqc_base.exists():
+        if not reupload:
+            alts = sorted(vqc_base.rglob(f"vqc_q{n_qubits}_l{n_layers}_*noreupload*.pt"))
+            if alts:
+                return _sync_and_return(max(alts, key=lambda f: f.stat().st_mtime))
+        alts = sorted(vqc_base.rglob(f"vqc_q{n_qubits}_l{n_layers}_lr*.pt"))
+        if alts:
+            return _sync_and_return(max(alts, key=lambda f: f.stat().st_mtime))
+        alts = sorted(vqc_base.rglob(f"vqc_q{n_qubits}_l{n_layers}*.pt"))
+        if alts:
+            return _sync_and_return(max(alts, key=lambda f: f.stat().st_mtime))
+
     return None
 
 

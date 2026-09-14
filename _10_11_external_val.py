@@ -28,7 +28,7 @@ Outputs (../ppqfl-breast-cancer-screening/outputs/external_val_outputs/):
 """
 
 from copy import deepcopy
-import json, pickle, re, warnings
+import json, pickle, re, warnings, shutil
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
 
@@ -183,6 +183,85 @@ class VQCModel(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+def find_vqc_checkpoint(vqc_dir: Path, n_qubits: int, n_layers: int, lr: float, reupload: bool = True) -> Optional[Path]:
+    """
+    Robustly search for a VQC checkpoint across regime_A, reupload_ablation, sweep, regime_B,
+    and the vqc_outputs root.
+    If found outside regime_A, automatically mirrors the checkpoint into regime_A so that
+    downstream evaluations always find it in the canonical location.
+    """
+    vqc_dir = Path(vqc_dir)
+    vqc_base = vqc_dir.parent if vqc_dir.name in ("regime_A", "regime_B", "sweep", "reupload_ablation", "noise") else vqc_dir
+    regime_a_dir = vqc_base / "regime_A"
+    regime_a_dir.mkdir(parents=True, exist_ok=True)
+
+    search_dirs = [
+        regime_a_dir,
+        vqc_base / "reupload_ablation",
+        vqc_base / "sweep",
+        vqc_base / "regime_B",
+        vqc_base,
+    ]
+
+    suffix = "" if reupload else "_noreupload"
+    exact_specific = f"vqc_q{n_qubits}_l{n_layers}_lr{lr}{suffix}.pt"
+    exact_generic = f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt"
+
+    def _sync_and_return(src: Path) -> Path:
+        if src.parent.resolve() != regime_a_dir.resolve():
+            dest = regime_a_dir / src.name
+            try:
+                if not dest.exists():
+                    shutil.copy2(src, dest)
+                    print(f"  [Auto-sync] Mirrored checkpoint to: {dest}")
+                if "_noreupload" in src.name:
+                    gen_dest = regime_a_dir / exact_generic
+                    if not gen_dest.exists():
+                        shutil.copy2(src, gen_dest)
+            except Exception:
+                pass
+        return src
+
+    # 1. Exact match with expected suffix across subdirs
+    for d in search_dirs:
+        p = d / exact_specific
+        if p.exists():
+            return _sync_and_return(p)
+
+    # 2. Generic match across subdirs
+    for d in search_dirs:
+        p = d / exact_generic
+        if p.exists():
+            return _sync_and_return(p)
+
+    # 3. Pattern match across search dirs
+    for d in search_dirs:
+        if not d.exists():
+            continue
+        if not reupload:
+            alts = sorted(d.glob(f"vqc_q{n_qubits}_l{n_layers}_*noreupload*.pt"))
+            if alts:
+                return _sync_and_return(max(alts, key=lambda f: f.stat().st_mtime))
+        alts = sorted(d.glob(f"vqc_q{n_qubits}_l{n_layers}_lr*.pt"))
+        if alts:
+            return _sync_and_return(max(alts, key=lambda f: f.stat().st_mtime))
+
+    # 4. Recursive search across entire vqc_base
+    if vqc_base.exists():
+        if not reupload:
+            alts = sorted(vqc_base.rglob(f"vqc_q{n_qubits}_l{n_layers}_*noreupload*.pt"))
+            if alts:
+                return _sync_and_return(max(alts, key=lambda f: f.stat().st_mtime))
+        alts = sorted(vqc_base.rglob(f"vqc_q{n_qubits}_l{n_layers}_lr*.pt"))
+        if alts:
+            return _sync_and_return(max(alts, key=lambda f: f.stat().st_mtime))
+        alts = sorted(vqc_base.rglob(f"vqc_q{n_qubits}_l{n_layers}*.pt"))
+        if alts:
+            return _sync_and_return(max(alts, key=lambda f: f.stat().st_mtime))
+
+    return None
+
+
 def load_or_train_vqc(n_qubits: int, n_layers: int, lr: float = 0.01,
                       X_train_scaled: Optional[np.ndarray] = None,
                       y_train: Optional[np.ndarray] = None,
@@ -191,31 +270,17 @@ def load_or_train_vqc(n_qubits: int, n_layers: int, lr: float = 0.01,
                       reupload: bool = True) -> VQCModel:
     """Load existing VQC checkpoint across all directories, or fit quickly with validation early-stopping."""
     seed_everything(42)
-    suffix = "" if reupload else "_noreupload"
-
-    candidates = [
-        VQC_DIR_A / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}{suffix}.pt",
-        VQC_DIR_A / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt",
-        VQC_DIR_A.parent / "sweep" / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}{suffix}.pt",
-        VQC_DIR_A.parent / "sweep" / f"vqc_q{n_qubits}_l{n_layers}_lr{lr}.pt",
-    ]
-    for p in [VQC_DIR_A, VQC_DIR_A.parent / "sweep", BASE / "vqc_outputs"]:
-        if p.exists():
-            candidates.extend(list(p.glob(f"vqc_q{n_qubits}_l{n_layers}_*{suffix}.pt")))
-            candidates.extend(list(p.glob(f"vqc_q{n_qubits}_l{n_layers}_*.pt")))
-
-    for ckpt in candidates:
-        if ckpt.exists():
-            # Check if checkpoint name explicitly denotes noreupload
-            ckpt_reup = False if "_noreupload" in ckpt.name else reupload
-            model = VQCModel(n_qubits, n_layers, reupload=ckpt_reup)
-            try:
-                model.load_state_dict(torch.load(ckpt, map_location="cpu"))
-                print(f"  Loaded VQC checkpoint: {ckpt.name} (reupload={ckpt_reup})")
-                model.eval()
-                return model
-            except Exception:
-                continue
+    ckpt = find_vqc_checkpoint(VQC_DIR_A, n_qubits, n_layers, lr, reupload=reupload)
+    if ckpt is not None and ckpt.exists():
+        ckpt_reup = False if "_noreupload" in ckpt.name else reupload
+        model = VQCModel(n_qubits, n_layers, reupload=ckpt_reup)
+        try:
+            model.load_state_dict(torch.load(ckpt, map_location="cpu"))
+            print(f"  Loaded VQC checkpoint: {ckpt.name} (reupload={ckpt_reup})")
+            model.eval()
+            return model
+        except Exception as e:
+            print(f"  [WARN] Failed to load checkpoint {ckpt}: {e}")
 
     model = VQCModel(n_qubits, n_layers, reupload=reupload)
 

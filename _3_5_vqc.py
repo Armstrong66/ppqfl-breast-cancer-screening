@@ -1187,13 +1187,20 @@ def run_reuploading_ablation(finalist_configs: list) -> list:
         results.append(res_no)
         print(f"    No Re-upload (q={nq}, l={nl}): Val AUC={res_no['best_val_auc']:.4f} | Test AUC={res_no['test_auc_roc']:.4f} | Test F1(τ*)={res_no['test_f1_opt']:.4f}")
         
+        # Mirror checkpoint to regime_A
+        ckpt_name = f"vqc_q{nq}_l{nl}_lr{lr}_noreupload.pt"
+        src_ckpt = out / ckpt_name
+        if src_ckpt.exists():
+            regime_a_dir = OUT_DIR / "regime_A"
+            regime_a_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_ckpt, regime_a_dir / ckpt_name)
+            gen_name = f"vqc_q{nq}_l{nl}_lr{lr}.pt"
+            if not (regime_a_dir / gen_name).exists():
+                shutil.copy2(src_ckpt, regime_a_dir / gen_name)
+        
     return results
 
 
-def export_finalist_configs(regime_A_results: list, regime_B_results: list, sweep_results: list) -> list:
-    """
-    Tier 1 Item 2 Stage A: Select top finalist configurations and export finalist_configs.json.
-    """
 def select_finalists(sweep_results: list, top_k: int = 3, min_val_auc: float = 0.88) -> dict:
     """
     Select two explicitly labeled, non-exclusive categories of finalists:
@@ -1288,6 +1295,32 @@ def export_finalist_configs(regime_A_results: list, regime_B_results: list, swee
             "vqc_params": int(best_B.get("vqc_params", best_B["n_qubits"] * best_B["n_layers"] + 1)),
             "rank": "Regime B Primary Finalist",
         }
+
+    # Ensure all finalist checkpoints are mirrored into regime_A for seamless downstream access
+    regime_a_dir = OUT_DIR / "regime_A"
+    regime_a_dir.mkdir(parents=True, exist_ok=True)
+    all_finalists = list(finalist_dict.get("performance_finalists", [])) + list(finalist_dict.get("efficiency_finalists", []))
+    if "regime_b_finalist" in finalist_dict:
+        all_finalists.append(finalist_dict["regime_b_finalist"])
+
+    for f_cfg in all_finalists:
+        nq = int(f_cfg["n_qubits"])
+        nl = int(f_cfg["n_layers"])
+        lr = float(f_cfg.get("lr", 0.01))
+        reup = bool(f_cfg.get("reupload", True))
+        suffix = "" if reup else "_noreupload"
+        ckpt_name = f"vqc_q{nq}_l{nl}_lr{lr}{suffix}.pt"
+        gen_name = f"vqc_q{nq}_l{nl}_lr{lr}.pt"
+
+        for src_dir in [OUT_DIR / "sweep", OUT_DIR / "reupload_ablation", OUT_DIR / "regime_B", regime_a_dir]:
+            src = src_dir / ckpt_name
+            if src.exists():
+                if src.parent != regime_a_dir:
+                    shutil.copy2(src, regime_a_dir / ckpt_name)
+                    print(f"  [Finalist Sync] Mirrored {ckpt_name} to regime_A")
+                if not (regime_a_dir / gen_name).exists():
+                    shutil.copy2(src, regime_a_dir / gen_name)
+                break
 
     finalist_path = OUT_DIR / "finalist_configs.json"
     with open(finalist_path, "w") as f:
