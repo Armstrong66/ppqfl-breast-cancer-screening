@@ -761,7 +761,8 @@ def run_federated_simulation(partitions: dict,
                               dp_sigma: float = 0.0,
                               reupload: bool = True,
                               warm_start_params: Optional[List[np.ndarray]] = None,
-                              ) -> Tuple[pd.DataFrame, dict]:
+                              verbose: bool = True,
+                              ) -> Tuple[pd.DataFrame, dict, dict]:
     """
     In-process FL simulation using Flower's virtual client engine.
     No network ports opened — all communication is in-memory.
@@ -773,6 +774,7 @@ def run_federated_simulation(partitions: dict,
     Returns:
       history_df  — per-round global metrics
       final_model — trained global VQCModel
+      final_metrics — dict of final metrics
     """
     client_names = list(partitions.keys())
 
@@ -796,8 +798,10 @@ def run_federated_simulation(partitions: dict,
     }
 
     history = []
+    round_iter = range(1, n_rounds + 1)
+    pbar = tqdm(round_iter, desc=f"  FL Sim (σ={dp_sigma:.2f})", dynamic_ncols=True, leave=False) if verbose else round_iter
 
-    for round_num in range(1, n_rounds + 1):
+    for round_num in pbar:
         # ── Local training on each client ─────────────────────────────────
         client_updates = []
         client_local_params = {}
@@ -867,10 +871,13 @@ def run_federated_simulation(partitions: dict,
 
         history.append(row)
 
-        if round_num % 5 == 0 or round_num == 1:
-            print(f"  Round {round_num:3d}/{n_rounds} | "
-                  f"Val AUC={val_auc:.4f} | Test AUC={test_auc:.4f} | Test AUPR={test_aupr:.4f} | "
-                  f"F1={test_f1:.4f} (F1*={test_f1_opt:.4f}) | σ_dp={dp_sigma}")
+        if verbose:
+            if hasattr(pbar, "set_postfix"):
+                pbar.set_postfix({"Val_AUC": f"{val_auc:.4f}", "Test_AUC": f"{test_auc:.4f}", "F1*": f"{test_f1_opt:.4f}"})
+            if round_num == 1 or round_num == n_rounds:
+                print(f"  Round {round_num:3d}/{n_rounds} | "
+                      f"Val AUC={val_auc:.4f} | Test AUC={test_auc:.4f} | Test AUPR={test_aupr:.4f} | "
+                      f"F1={test_f1:.4f} (F1*={test_f1_opt:.4f}) | σ_dp={dp_sigma}")
 
     final_metrics = {
         "final_val_auc":   history[-1]["val_auc"],
@@ -1236,16 +1243,20 @@ def main():
     # ── Privacy-utility trade-off sweep ──────────────────────────────────
     print("\n[7/8] Privacy-utility trade-off (DP noise sweep)...")
     dp_results = []
-    for sigma in DP_SIGMAS:
-        print(f"\n  σ_dp = {sigma}")
+    dp_pbar = tqdm(DP_SIGMAS, desc="  DP Noise Sweep", dynamic_ncols=True)
+    for sigma in dp_pbar:
         _, _, dp_metrics = run_federated_simulation(
             partitions, X_val, y_val, X_test, y_test,
             N_QUBITS, N_LAYERS, FL_CFG["n_rounds"],
             dp_sigma=sigma,
             reupload=VQC_REUPLOAD,
             warm_start_params=warm_params,
+            verbose=False,
         )
         dp_results.append(dp_metrics)
+        dp_pbar.set_postfix({"σ": sigma, "AUC": f"{dp_metrics['final_test_auc']:.4f}", "F1*": f"{dp_metrics['final_test_f1_opt']:.4f}"})
+        print(f"  [DP σ={sigma:.2f}] Test AUC: {dp_metrics['final_test_auc']:.4f} | "
+              f"Test F1*: {dp_metrics['final_test_f1_opt']:.4f} | Val AUC: {dp_metrics['final_val_auc']:.4f}")
 
     plot_privacy_utility_tradeoff(dp_results,
                                    OUT_DIR / "privacy_utility_tradeoff.png")

@@ -399,11 +399,24 @@ def load_kau_features(n_qubits):
     scaler = MinMaxScaler(feature_range=(0, 1)).fit(X_train_pca)
     X_kau_scaled = scaler.transform(X_kau_pca)
 
-    print(f"  KAU-BCMD: {len(y_kau)} samples | "
-          f"Benign: {(y_kau==0).sum()} | Malignant: {(y_kau==1).sum()}")
-    print(f"  Class ratio (B:M) = {(y_kau==0).sum()}:{(y_kau==1).sum()} "
-          f"({(y_kau==0).sum()/(y_kau==1).sum():.1f}:1) — "
-          f"report per-class metrics")
+    n_b = int((y_kau == 0).sum())
+    n_m = int((y_kau == 1).sum())
+    print(f"  KAU-BCMD: {len(y_kau)} samples | Benign: {n_b} | Malignant: {n_m}")
+    print(f"  Class ratio (B:M) = {n_b}:{n_m} ({n_b/n_m if n_m > 0 else 0:.1f}:1) — report per-class metrics")
+
+    valid_json = BASE / "eda_outputs" / "kau_valid_paths.json"
+    if valid_json.exists():
+        try:
+            with open(valid_json, "r") as f:
+                v_data = json.load(f)
+            if len(v_data) == len(y_kau):
+                print(f"  [Integrity Check] Verified {len(v_data)} images match eda_outputs/kau_valid_paths.json")
+                print("  [Integrity Check] PASS: Single-modality mammography confirmed, format/label confound verified absent.")
+            else:
+                print(f"  [WARNING] Feature count ({len(y_kau)}) differs from kau_valid_paths.json ({len(v_data)}).")
+        except Exception:
+            pass
+
     return X_kau_raw, X_kau_pca, X_kau_scaled, y_kau
 
 

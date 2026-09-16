@@ -485,10 +485,12 @@ def mc_dropout_predict(head: nn.Module, X_t: torch.Tensor,
 def quantum_shot_variance(model_det: HQCNNClassifier,
                           X_test: np.ndarray,
                           n_repeats: int = 20,
-                          n_shots: int = N_SHOTS) -> tuple:
+                          n_shots: int = N_SHOTS,
+                          seed: int = 42) -> tuple:
     """
     Estimate quantum measurement uncertainty by running the circuit
     n_repeats times per sample with finite shots.
+    Explicit seed guarantees 100% reproducibility of stochastic shot sampling.
 
     For each sample x:
       - Run circuit n_repeats times, each with n_shots shots
@@ -499,8 +501,9 @@ def quantum_shot_variance(model_det: HQCNNClassifier,
       mean_probs  : (N,) — mean P(malignant) across repeats
       var_probs   : (N,) — variance across repeats (quantum uncertainty)
     """
+    seed_everything(seed)
     print(f"  Computing quantum shot variance "
-          f"(n_repeats={n_repeats}, n_shots={n_shots})...")
+          f"(n_repeats={n_repeats}, n_shots={n_shots}, seed={seed})...")
     print("  Note: this is slow — each sample runs the circuit "
           f"{n_repeats}× with {n_shots} shots each.")
 
@@ -897,6 +900,103 @@ def plot_calibration_comparison(y_true, probs_before, probs_after,
     print(f"  Saved: {save_path}")
 
 
+def evaluate_finalists_uq(finalists_file: Path, y_test: np.ndarray) -> Optional[pd.DataFrame]:
+    """Evaluate UQ and calibration metrics across all finalists in finalist_configs.json."""
+    if not finalists_file.exists():
+        return None
+    try:
+        with open(finalists_file) as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"  [WARN] Failed to load {finalists_file}: {e}")
+        return None
+
+    finalists = []
+    if isinstance(data, dict):
+        for item in data.get("performance_finalists", []):
+            finalists.append((item, "Performance"))
+        for item in data.get("efficiency_finalists", []):
+            finalists.append((item, "Efficiency"))
+    elif isinstance(data, list):
+        for item in data:
+            finalists.append((item, "Finalist"))
+
+    if not finalists:
+        return None
+
+    print("\n[Coverage] Evaluating UQ metrics across all finalists from finalist_configs.json...")
+    rows = []
+    seen = set()
+
+    for item, category in finalists:
+        nq = int(item.get("n_qubits", 4))
+        nl = int(item.get("n_layers", 2))
+        lr = float(item.get("lr", 0.01))
+        reup = bool(item.get("reupload", True))
+        if "no reupload" in item.get("notes", "").lower() or "noreupload" in item.get("name", "").lower():
+            reup = False
+        key = (nq, nl, lr, reup)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        ckpt_path = find_vqc_checkpoint(VQC_CKPT_DIR / "regime_A", nq, nl, lr, reup)
+        if ckpt_path is None:
+            continue
+
+        try:
+            X_test_q, _ = load_test_split(nq)
+            X_t_q = torch.tensor(X_test_q, dtype=torch.float32)
+
+            model = load_vqc_checkpoint(nq, nl, lr, shot_based=False, reupload=reup)
+            model.eval()
+            with torch.no_grad():
+                probs_raw = model(X_t_q).numpy()
+
+            auc_raw = roc_auc_score(y_test, probs_raw)
+            aupr_raw = average_precision_score(y_test, probs_raw) if len(set(y_test)) > 1 else 0.0
+            ece_raw = expected_calibration_error(y_test, probs_raw)
+
+            X_val_pca = np.load(FEAT_DIR / f"features_val_pca{nq}.npy")
+            X_train_pca = np.load(FEAT_DIR / f"features_train_pca{nq}.npy")
+            y_val = np.load(FEAT_DIR / "labels_val.npy")
+            scaler_fit = MinMaxScaler().fit(X_train_pca)
+            X_val_scaled = scaler_fit.transform(X_val_pca)
+
+            T_opt, probs_scaled, _ = temperature_scale_vqc(model, X_val_scaled, y_val, X_test=X_test_q)
+            ece_scaled = expected_calibration_error(y_test, probs_scaled)
+
+            _, shot_var, _ = quantum_shot_variance(model, X_test_q, n_repeats=10, n_shots=100)
+            mean_shot_var = float(shot_var.mean())
+
+            rows.append({
+                "category": category,
+                "n_qubits": nq,
+                "n_layers": nl,
+                "lr": lr,
+                "reupload": reup,
+                "test_auc": round(auc_raw, 4),
+                "test_aupr": round(aupr_raw, 4),
+                "ece_raw": round(ece_raw, 4),
+                "T_optimal": round(T_opt, 4),
+                "ece_scaled": round(ece_scaled, 4),
+                "mean_shot_variance": round(mean_shot_var, 8),
+            })
+            print(f"  Finalist ({category}) q={nq} l={nl} reup={reup}: Test AUC={auc_raw:.4f} | "
+                  f"Raw ECE={ece_raw:.4f} → Scaled ECE={ece_scaled:.4f} (T={T_opt:.2f}) | "
+                  f"Shot Var={mean_shot_var:.6f}")
+        except Exception as e:
+            print(f"  [WARN] Failed evaluating finalist q={nq} l={nl}: {e}")
+
+    if rows:
+        df = pd.DataFrame(rows)
+        out_csv = OUT_DIR / "finalists_uq_summary.csv"
+        df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+        print(f"  Saved multi-finalist UQ summary to: {out_csv}")
+        return df
+    return None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 9.  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1042,6 +1142,11 @@ def main():
                  "confirm auc_scaled ≈ vqc point-estimate auc.")
     }
 
+    # ── Multi-finalist coverage ───────────────────────────────────────────
+    finalists_df = evaluate_finalists_uq(VQC_CKPT_DIR / "finalist_configs.json", y_test)
+    if finalists_df is not None:
+        summary["finalists_uq"] = finalists_df.to_dict(orient="records")
+
     # ── Save summary ──────────────────────────────────────────────────────
     with open(OUT_DIR / "uq_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
@@ -1050,11 +1155,12 @@ def main():
     print("  UNCERTAINTY QUANTIFICATION COMPLETE")
     print(f"  Outputs saved to: {OUT_DIR}")
     print("\n  Key metrics:")
-    print(f"    Classical ECE      : {mc_ece:.4f} (lower = better calibrated)")
-    print(f"    Quantum ECE raw    : {q_ece:.4f}")
-    print(f"    Quantum ECE scaled : {ece_after:.4f}  (T={T_opt:.3f})")
-    print(f"    Classical mean unc : {mc_std.mean():.4f} (MC-Dropout std)")
-    print(f"    Quantum mean unc   : {q_var.mean():.6f} (shot variance)")
+    print(f"    Classical ECE (MC-Dropout)       : {mc_ece:.4f} (lower = better calibrated)")
+    print(f"    Quantum ECE (Point Estimate)     : {ece_before:.4f} (deterministic raw)")
+    print(f"    Quantum ECE (Shot-based N={N_SHOTS})   : {q_ece:.4f} (sampling noise)")
+    print(f"    Quantum ECE (Temperature-scaled) : {ece_after:.4f} (post-hoc calibrated, T={T_opt:.3f})")
+    print(f"    Classical mean unc (MC-Dropout)  : {mc_std.mean():.4f}")
+    print(f"    Quantum mean unc (Shot variance) : {q_var.mean():.6f}")
     print("\n  Interpretation guide:")
     print("    ECE < 0.05  → well calibrated")
     print("    ECE 0.05–0.15 → moderate miscalibration (common in small datasets)")

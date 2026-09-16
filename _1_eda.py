@@ -13,6 +13,7 @@ Datasets: (1) Mendeley Mammogram Dataset — Polokwane, South Africa
 import os, warnings, json
 from pathlib import Path
 from collections import Counter, defaultdict
+from typing import Optional, List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -74,15 +75,46 @@ def find_kau_root() -> Path:
     # Server paths as fallback
     server_paths = [
         Path("/data/derrick/kau"),
+        Path("/data/derrick"),
     ]
     for p in relative_paths + server_paths:
-        if p.exists() and (p / "BIRAD1").exists():
+        if p.exists() and (
+            (p / "BIRAD1").exists() or (p / "b1").exists() or
+            (p / "BIRADS_1").exists() or (p / "Metadata.csv").exists() or
+            (p / "metadata.csv").exists() or (p / "DICOM Images").exists() or
+            (p / "Birad3").exists()
+        ):
+            return p.resolve()
+    for p in relative_paths + server_paths:
+        if p.exists() and p.is_dir() and "kau" in p.name.lower():
             return p.resolve()
     raise FileNotFoundError(
         f"KAU-BCMD dataset not found. Searched:\n"
         f"  Relative paths:\n    " + "\n    ".join(str(p) for p in relative_paths) + "\n"
         f"  Server paths:\n    " + "\n    ".join(str(p) for p in server_paths)
     )
+
+def find_kau_metadata(kau_root: Path) -> Optional[Path]:
+    """Search for official KAU Metadata.csv in kau_root and adjacent directories."""
+    candidate_paths = [
+        kau_root / "Metadata.csv",
+        kau_root / "metadata.csv",
+        kau_root.parent / "Metadata.csv",
+        kau_root.parent / "metadata.csv",
+        Path("/data/derrick/kau/Metadata.csv"),
+        Path("/data/derrick/Metadata.csv"),
+        Path("./kau/Metadata.csv"),
+        Path("../kau/Metadata.csv"),
+    ]
+    for cp in candidate_paths:
+        if cp.exists() and cp.is_file():
+            return cp.resolve()
+    # Search for any CSV file containing 'metadata' in name
+    for cp in kau_root.glob("*metadata*.csv"):
+        return cp.resolve()
+    for cp in kau_root.parent.glob("*metadata*.csv"):
+        return cp.resolve()
+    return None
 
 # ── Mendeley (Polokwane, South Africa) ──────────────────────────────────────
 ROOT_MENDELEY = find_mendeley_root()
@@ -92,16 +124,15 @@ MENDELEY_MALIGNANT = ROOT_MENDELEY / "Malignant"
 # ── KAU-BCMD ────────────────────────────────────────────────────────────────
 # KAU uses BI-RADS grading, not a flat Benign/Malignant structure.
 # Binarisation follows clinical convention:
-#   BI-RADS 1, 3  → Benign   (label 0)
-#   BI-RADS 4, 5  → Malignant (label 1)
+#   BI-RADS 1, 2, 3 → Benign   (label 0)
+#   BI-RADS 4, 5    → Malignant (label 1)
 ROOT_KAU = find_kau_root()
 KAU_BIRAD_MAP = {
     0: [ROOT_KAU / "BIRAD1" / "b1",
-        ROOT_KAU / "Birad3" / "b3"],        # Benign
+        ROOT_KAU / "Birad3" / "b3"],        # Benign (legacy fallback folders)
     1: [ROOT_KAU / "Birad4" / "b4",
-        ROOT_KAU / "Birad5" / "Birad5"],    # Malignant
+        ROOT_KAU / "Birad5" / "Birad5"],    # Malignant (legacy fallback folders)
 }
-# Dummy vars kept so downstream calls that pass KAU_BENIGN/KAU_MALIGNANT still work
 KAU_BENIGN    = KAU_BIRAD_MAP[0][0]   # used only as a path-existence hint
 KAU_MALIGNANT = KAU_BIRAD_MAP[1][0]
 
@@ -212,37 +243,198 @@ def collect_image_paths(benign_dir: Path, malignant_dir: Path,
     return df
 
 
-def collect_kau_paths(birad_map: dict, dataset_name: str = "KAU-BCMD") -> pd.DataFrame:
+def is_kau_mask_path(path: Path) -> bool:
     """
-    KAU-BCMD uses BI-RADS grading folders, not flat Benign/Malignant.
-    birad_map: {label_int: [list of Path dirs]}
-    BI-RADS 1,3 → Benign (0); BI-RADS 4,5 → Malignant (1)
+    Folder/filename-based mask exclusion, extending mask hints to also cover
+    KAU-specific naming ('Tumor Masks', 'masks', 'segmentation', 'reports', etc.).
+    Needed because JPEG masks do not use mode == '1' and evade PIL mode filters.
     """
+    hints = {"tumor masks", "tumor mask", "mask", "masks", "segmentation",
+             "segmentations", "report", "reports", "ground_truth", "groundtruth", "gt"}
+    parts = [part.lower() for part in path.parts[:-1]]
+    stem = path.stem.lower()
+    if any(any(h in part for h in hints) for part in parts):
+        return True
+    return any(h in stem for h in hints)
+
+
+def collect_kau_paths_from_metadata(metadata_csv: Path, kau_root: Path,
+                                    dataset_name: str = "KAU-BCMD") -> pd.DataFrame:
+    """
+    Ingest KAU-BCMD strictly from the official Metadata.csv.
+    Every row's image path is verified on disk. Non-primary content (masks,
+    reports, composite sheets) is filtered out systematically.
+    BI-RADS mapping: 1, 2, 3 -> Benign (0); 4, 5 -> Malignant (1).
+    """
+    print(f"  [KAU Ingestion] Using official metadata: {metadata_csv}")
+    meta = pd.read_csv(metadata_csv)
+    col_map = {c.strip().lower(): c for c in meta.columns}
+
+    assess_col = None
+    for cand in ["assessment", "birads", "bi-rads", "birad", "class", "grade"]:
+        if cand in col_map:
+            assess_col = col_map[cand]
+            break
+    if assess_col is None:
+        raise ValueError(f"Could not find Assessment / BI-RADS column in {metadata_csv}. Columns: {list(meta.columns)}")
+
+    path_col = None
+    for cand in ["images path", "image path", "images_path", "image_path", "path", "file_path", "filename", "file"]:
+        if cand in col_map:
+            path_col = col_map[cand]
+            break
+    if path_col is None:
+        raise ValueError(f"Could not find Images Path column in {metadata_csv}. Columns: {list(meta.columns)}")
+
     label_names = {0: "Benign", 1: "Malignant"}
+    birad_to_label = {1: 0, 2: 0, 3: 0, 4: 1, 5: 1}
+
     records = []
-    skipped_mask_folder = 0
+    skipped_aspect = 0
+    skipped_masks = 0
+    skipped_missing = 0
+
+    for _, row in meta.iterrows():
+        raw_val = row[assess_col]
+        try:
+            if isinstance(raw_val, str):
+                import re
+                m = re.search(r"(\d+)", raw_val)
+                grade = int(m.group(1)) if m else None
+            else:
+                grade = int(raw_val)
+        except Exception:
+            continue
+
+        if grade not in birad_to_label:
+            continue
+        label_int = birad_to_label[grade]
+
+        rel_p = str(row[path_col]).replace("\\", "/")
+        candidate_file = None
+        for candidate in [
+            kau_root / rel_p,
+            kau_root.parent / rel_p,
+            Path(rel_p),
+        ]:
+            if candidate.exists() and candidate.is_file():
+                candidate_file = candidate
+                break
+
+        if candidate_file is None:
+            fname = Path(rel_p).name
+            matches = list(kau_root.glob(f"**/{fname}"))
+            if matches:
+                candidate_file = matches[0]
+
+        if candidate_file is None:
+            skipped_missing += 1
+            continue
+
+        if is_kau_mask_path(candidate_file):
+            skipped_masks += 1
+            continue
+
+        try:
+            with Image.open(candidate_file) as img:
+                if img.mode == "1":
+                    continue
+                w, h = img.width, img.height
+                aspect = w / h if h > 0 else 0
+                if aspect > 1.30:
+                    skipped_aspect += 1
+                    continue
+        except Exception:
+            continue
+
+        records.append({
+            "path":      str(candidate_file),
+            "label":     label_names[label_int],
+            "label_int": label_int,
+            "filename":  candidate_file.name,
+            "ext":       candidate_file.suffix.lower(),
+            "dataset":   dataset_name,
+            "birad_dir": f"BIRADS_{grade}",
+        })
+
+    print(f"  [Metadata Ingestion] Ingested {len(records)} valid images "
+          f"(skipped {skipped_aspect} wide composites, {skipped_masks} masks, {skipped_missing} missing on disk).")
+    df = pd.DataFrame(records)
+    if df.empty:
+        raise FileNotFoundError(f"Metadata ingestion from {metadata_csv} yielded 0 images.")
+    return df
+
+
+def collect_kau_paths(kau_root: Path,
+                      birad_map: Optional[dict] = None,
+                      dataset_name: str = "KAU-BCMD") -> pd.DataFrame:
+    """
+    Collect KAU-BCMD mammograms with dual ingestion strategy:
+    1. Primary: If Metadata.csv exists, ingest official CC/MLO views directly.
+    2. Fallback: Auto-discover all BI-RADS folders (b1..b5, BIRADS_1..5),
+       strictly filtering out masks and wide composite contact sheets (W/H > 1.30).
+    """
+    metadata_csv = find_kau_metadata(kau_root)
+    if metadata_csv is not None:
+        try:
+            return collect_kau_paths_from_metadata(metadata_csv, kau_root, dataset_name)
+        except Exception as e:
+            print(f"  [WARNING] Metadata-driven ingestion failed ({e}). Falling back to directory crawl.")
+
+    print("  [KAU Ingestion] Running expanded directory auto-discovery...")
+    label_names = {0: "Benign", 1: "Malignant"}
+    benign_dirs = []
+    malignant_dirs = []
+
+    for d in kau_root.rglob("*"):
+        if not d.is_dir():
+            continue
+        d_name_lower = d.name.lower()
+        if is_kau_mask_path(d):
+            continue
+        if any(d_name_lower == b for b in ["b1", "b2", "b3", "birad1", "birad2", "birad3", "birads_1", "birads_2", "birads_3", "birad_1", "birad_2", "birad_3"]):
+            benign_dirs.append(d)
+        elif any(d_name_lower == m for m in ["b4", "b5", "birad4", "birad5", "birads_4", "birads_5", "birad_4", "birad_5"]):
+            malignant_dirs.append(d)
+
+    if birad_map:
+        for p in birad_map.get(0, []):
+            if p.exists() and p not in benign_dirs:
+                benign_dirs.append(p)
+        for p in birad_map.get(1, []):
+            if p.exists() and p not in malignant_dirs:
+                malignant_dirs.append(p)
+
+    target_groups = [(0, benign_dirs), (1, malignant_dirs)]
+    records = []
+    skipped_mask_count = 0
     skipped_binary_mode = 0
-    skipped_mask_paths = []
-    skipped_mode_paths = []
-    for label_int, dirs in birad_map.items():
+    skipped_aspect_count = 0
+
+    for label_int, dirs in target_groups:
+        seen_files = set()
         for directory in dirs:
-            if not directory.exists():
-                print(f"  [WARNING] KAU dir not found: {directory}")
-                continue
             files = sorted([f for f in directory.rglob("*") if f.suffix.lower() in SUPPORTED_EXT], key=lambda p: str(p))
             for f in files:
-                if is_mask_path(f):
-                    skipped_mask_folder += 1
-                    skipped_mask_paths.append(f)
+                if f in seen_files:
+                    continue
+                seen_files.add(f)
+                if is_kau_mask_path(f):
+                    skipped_mask_count += 1
                     continue
                 try:
                     with Image.open(f) as img:
                         if img.mode == "1":
                             skipped_binary_mode += 1
-                            skipped_mode_paths.append(f)
+                            continue
+                        w, h = img.width, img.height
+                        aspect = w / h if h > 0 else 0
+                        if aspect > 1.30:
+                            skipped_aspect_count += 1
                             continue
                 except Exception:
                     pass
+
                 records.append({
                     "path":      str(f),
                     "label":     label_names[label_int],
@@ -252,19 +444,61 @@ def collect_kau_paths(birad_map: dict, dataset_name: str = "KAU-BCMD") -> pd.Dat
                     "dataset":   dataset_name,
                     "birad_dir": directory.name,
                 })
-    if skipped_mask_folder > 0:
-        folders = sorted({p.parent.name for p in skipped_mask_paths})
-        print(f"  Skipped {skipped_mask_folder} KAU files from mask/segmentation folders: {folders}")
+
+    if skipped_mask_count > 0:
+        print(f"  Skipped {skipped_mask_count} KAU mask/report files")
     if skipped_binary_mode > 0:
-        folders = sorted({p.parent.name for p in skipped_mode_paths})
-        print(f"  Skipped {skipped_binary_mode} KAU binary mask files by image mode: {folders}")
+        print(f"  Skipped {skipped_binary_mode} KAU binary mask mode files")
+    if skipped_aspect_count > 0:
+        print(f"  Skipped {skipped_aspect_count} KAU non-standard composite/strip images (aspect W/H > 1.30)")
+
     df = pd.DataFrame(records)
     if df.empty:
         raise FileNotFoundError(
-            f"No images found for {dataset_name}.\n"
-            f"Check KAU_BIRAD_MAP paths at the top of this script."
+            f"No valid images found for {dataset_name}.\n"
+            f"Searched under {kau_root}."
         )
     return df
+
+
+def assert_no_format_confound(df_kau: pd.DataFrame, max_allowed_diff: float = 0.25):
+    """
+    Verify after filtering that no single (width, height) resolution cluster
+    or aspect-ratio cluster is disproportionately concentrated in one class.
+    Prevents shortcut learning from non-clinical image formats.
+    """
+    if df_kau.empty:
+        raise ValueError("Cannot run assert_no_format_confound on empty dataframe.")
+
+    overall_balance = df_kau["label_int"].mean()
+    n_benign = (df_kau["label_int"] == 0).sum()
+    n_malignant = (df_kau["label_int"] == 1).sum()
+    print(f"\n  [Integrity Audit] KAU-BCMD Cohort: {len(df_kau)} total images "
+          f"({n_benign} Benign, {n_malignant} Malignant | balance={overall_balance:.3f})")
+
+    confounds = []
+    if "width" in df_kau.columns and "height" in df_kau.columns:
+        for (w, h), group in df_kau.groupby(["width", "height"]):
+            if len(group) < 20:
+                continue
+            cluster_balance = group["label_int"].mean()
+            diff = abs(cluster_balance - overall_balance)
+            if diff > max_allowed_diff:
+                confounds.append(
+                    f"Cluster ({w}x{h}, n={len(group)}): class balance={cluster_balance:.3f} "
+                    f"vs overall={overall_balance:.3f} (diff={diff:.3f} > {max_allowed_diff})"
+                )
+
+    if confounds:
+        err_msg = (
+            "KAU-BCMD FORMAT/LABEL CONFOUND DETECTED:\n  " +
+            "\n  ".join(confounds) +
+            "\nClass label is confounded with image format. Aborting before external validation."
+        )
+        print(f"  [ERROR] {err_msg}")
+        raise ValueError(err_msg)
+
+    print("  [Integrity Audit] PASS: No format/label confound detected across resolution clusters.")
 
 
 def audit_image(path: str) -> dict:
@@ -549,6 +783,14 @@ def save_audit_csvs(df_m_audit: pd.DataFrame, df_k_audit: pd.DataFrame):
     print(f"    {mendeley_path}")
     print(f"    {kau_path}")
 
+    # Export validated clean KAU paths for downstream stages (_2b_feature_pca.py, _10_11_external_val.py)
+    clean_k = df_k_audit[~df_k_audit["is_corrupt"]].copy()
+    valid_records = clean_k[["path", "label", "label_int", "width", "height"]].to_dict(orient="records")
+    valid_json_path = OUT_DIR / "kau_valid_paths.json"
+    with open(valid_json_path, "w") as f:
+        json.dump(valid_records, f, indent=2)
+    print(f"    {valid_json_path} ({len(valid_records)} verified clean images)")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 10. TRAIN / VAL / TEST SPLIT REPORT
@@ -621,7 +863,7 @@ def main():
     # ── Step 1: Collect paths ────────────────────────────────────────────────
     print("\n[1/7] Collecting image paths...")
     df_m_paths = collect_image_paths(MENDELEY_BENIGN, MENDELEY_MALIGNANT, "Mendeley")
-    df_k_paths = collect_kau_paths(KAU_BIRAD_MAP)
+    df_k_paths = collect_kau_paths(ROOT_KAU, KAU_BIRAD_MAP)
     print(f"  Mendeley: {len(df_m_paths)} images  "
           f"({(df_m_paths['label']=='Benign').sum()} B / "
           f"{(df_m_paths['label']=='Malignant').sum()} M)")
@@ -633,6 +875,7 @@ def main():
     print("\n[2/7] Auditing images (dimensions, pixel stats, corruption check)...")
     df_m_audit = run_audit(df_m_paths)
     df_k_audit = run_audit(df_k_paths)
+    assert_no_format_confound(df_k_audit, max_allowed_diff=0.25)
 
     # ── Step 3: Class balance ────────────────────────────────────────────────
     print("\n[3/7] Plotting class balance...")
