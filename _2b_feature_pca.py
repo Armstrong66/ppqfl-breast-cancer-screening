@@ -139,8 +139,16 @@ def find_kau_root() -> Path:
     )
 
 def find_kau_metadata(kau_root: Path) -> Optional[Path]:
-    """Search for official KAU Metadata.csv in kau_root and adjacent directories."""
-    candidate_paths = [
+    """
+    Search for the official KAU-BCMD Metadata.csv.
+
+    Strategy (in order):
+    1. Direct candidate paths (kau_root, parent, known server paths).
+    2. Recursive rglob from kau_root and up to 3 parent directories.
+    3. Known Kaggle/data download trees on the Linux server.
+    4. Glob for any *metadata*.csv variant in all of the above.
+    """
+    direct = [
         kau_root / "Metadata.csv",
         kau_root / "metadata.csv",
         kau_root.parent / "Metadata.csv",
@@ -150,13 +158,47 @@ def find_kau_metadata(kau_root: Path) -> Optional[Path]:
         Path("./kau/Metadata.csv"),
         Path("../kau/Metadata.csv"),
     ]
-    for cp in candidate_paths:
+    for cp in direct:
         if cp.exists() and cp.is_file():
+            print(f"  [KAU Metadata] Found: {cp}")
             return cp.resolve()
-    for cp in kau_root.glob("*metadata*.csv"):
-        return cp.resolve()
-    for cp in kau_root.parent.glob("*metadata*.csv"):
-        return cp.resolve()
+
+    search_roots = [kau_root]
+    p = kau_root.parent
+    for _ in range(3):
+        search_roots.append(p)
+        p = p.parent
+
+    server_roots = [
+        Path("/home/derrick/projects/ppqfl-breast-cancer-screening"),
+        Path("/home/derrick/projects"),
+        Path("/home/derrick"),
+        Path("/data/derrick"),
+        Path("/data"),
+    ]
+    for sr in server_roots:
+        if sr.exists():
+            search_roots.append(sr)
+
+    seen_roots: set = set()
+    for root in search_roots:
+        if not root.exists() or root in seen_roots:
+            continue
+        seen_roots.add(root)
+        for name in ["Metadata.csv", "metadata.csv"]:
+            for hit in root.rglob(name):
+                print(f"  [KAU Metadata] Found via rglob: {hit}")
+                return hit.resolve()
+        for hit in root.rglob("*[Mm]etadata*.csv"):
+            print(f"  [KAU Metadata] Found via wildcard: {hit}")
+            return hit.resolve()
+
+    print(
+        f"  [KAU Metadata] WARNING: Metadata.csv not found.\n"
+        f"  Searched: {[str(r) for r in list(search_roots)[:6]]}...\n"
+        f"  Manual action required: locate Metadata.csv in the KAU-BCMD release\n"
+        f"  and place it at: {kau_root / 'Metadata.csv'}"
+    )
     return None
 
 ROOT_MENDELEY = find_mendeley_root()
@@ -262,7 +304,11 @@ def is_kau_mask_path(path: Path) -> bool:
 
 
 def assert_no_format_confound(df_kau: pd.DataFrame, max_allowed_diff: float = 0.25):
-    """Verify after filtering that no resolution cluster has an extreme class deviation."""
+    """
+    Two-level integrity check after KAU ingestion:
+    Level 1: Per-folder retention / class balance diagnostic.
+    Level 2: Per-resolution cluster check.
+    """
     if df_kau.empty:
         raise ValueError("Cannot run assert_no_format_confound on empty dataframe.")
 
@@ -272,6 +318,30 @@ def assert_no_format_confound(df_kau: pd.DataFrame, max_allowed_diff: float = 0.
     n_malignant = (df_kau[label_col] == 1).sum()
     print(f"  [Integrity Audit] KAU-BCMD Cohort: {len(df_kau)} total images "
           f"({n_benign} Benign, {n_malignant} Malignant | balance={overall_balance:.3f})")
+
+    if "birad_dir" in df_kau.columns:
+        print(f"  [Integrity Audit] Per-BI-RADS-folder class balance:")
+        print(f"  {'Folder':<20} {'n':>6} {'Benign':>8} {'Malignant':>10} {'Mal%':>7}")
+        print(f"  {'-'*20} {'-'*6} {'-'*8} {'-'*10} {'-'*7}")
+        folder_confounds = []
+        for folder, grp in df_kau.groupby("birad_dir"):
+            nb = (grp[label_col] == 0).sum()
+            nm = (grp[label_col] == 1).sum()
+            mal_pct = nm / len(grp) if len(grp) > 0 else 0.0
+            print(f"  {str(folder):<20} {len(grp):>6} {nb:>8} {nm:>10} {mal_pct:>6.1%}")
+            if "4" in str(folder).lower() or "5" in str(folder).lower():
+                if nm == 0 and len(grp) > 0:
+                    folder_confounds.append(
+                        f"  Folder '{folder}' (n={len(grp)}) is expected malignant "
+                        f"but contains 0 malignant images after filtering."
+                    )
+        if folder_confounds:
+            print(
+                "\n  [WARN] Per-folder confound signals detected:\n" +
+                "\n".join(folder_confounds) +
+                "\n  Heuristic filter may be misclassifying real malignant images."
+                "\n  Locate Metadata.csv and use metadata-driven ingestion."
+            )
 
     confounds = []
     if "width" in df_kau.columns and "height" in df_kau.columns:
@@ -345,19 +415,31 @@ def collect_kau_paths(birad_map: Optional[dict] = None, kau_root: Optional[Path]
                     continue
                 try:
                     with Image.open(cand) as img:
-                        if img.mode == "1" or (img.width / img.height if img.height else 0) > 1.30:
+                        if img.mode == "1":
                             continue
-                        records.append({"path": str(cand), "label": lbl, "width": img.width, "height": img.height})
+                        records.append({
+                            "path": str(cand),
+                            "label": lbl,
+                            "width": img.width,
+                            "height": img.height,
+                            "birad_dir": f"BIRADS_{grade}",
+                        })
                 except Exception:
                     continue
             df = pd.DataFrame(records)
             if not df.empty:
+                print(f"  [Metadata Ingestion] Successfully loaded {len(df)} images from {meta_csv.name}")
                 assert_no_format_confound(df)
                 return df[["path", "label"]]
         except Exception as e:
             print(f"  [WARNING] Metadata extraction failed: {e}. Falling back to directory scan.")
 
     # Fallback directory scan
+    print(
+        "\n  *** FALLBACK MODE: Metadata.csv not found. Using directory auto-discovery ***\n"
+        "  *** Aspect-ratio heuristic (W/H > 1.30) will be applied.                 ***\n"
+        "  *** If any BI-RADS folder is 100% eliminated, the pipeline will STOP.    ***\n"
+    )
     benign_dirs = []
     malignant_dirs = []
     for d in k_root.rglob("*"):
@@ -376,20 +458,61 @@ def collect_kau_paths(birad_map: Optional[dict] = None, kau_root: Optional[Path]
             if p.exists() and p not in malignant_dirs: malignant_dirs.append(p)
 
     records = []
+    folder_stats: Dict[str, Dict] = {}
+    skipped_aspect_count = 0
+
     for label_int, dirs in [(0, benign_dirs), (1, malignant_dirs)]:
         seen = set()
         for directory in dirs:
+            dir_name = directory.name
+            n_before = 0
+            n_after = 0
             for f in sorted(directory.rglob("*")):
                 if f.suffix.lower() not in SUPPORTED_EXT or f in seen or is_kau_mask_path(f):
                     continue
                 seen.add(f)
+                n_before += 1
                 try:
                     with Image.open(f) as img:
                         if img.mode == "1" or (img.width / img.height if img.height else 0) > 1.30:
+                            skipped_aspect_count += 1
                             continue
-                        records.append({"path": str(f), "label": label_int, "width": img.width, "height": img.height})
+                        n_after += 1
+                        records.append({
+                            "path": str(f),
+                            "label": label_int,
+                            "width": img.width,
+                            "height": img.height,
+                            "birad_dir": dir_name,
+                        })
                 except Exception:
                     pass
+
+            if dir_name not in folder_stats:
+                folder_stats[dir_name] = {"n_before": 0, "n_after": 0, "label_int": label_int}
+            folder_stats[dir_name]["n_before"] += n_before
+            folder_stats[dir_name]["n_after"] += n_after
+
+    # Per-folder retention table
+    print("\n  [Fallback Filter] Per-folder retention after W/H > 1.30 exclusion:")
+    print(f"  {'Folder':<20} {'Class':<12} {'Before':>8} {'After':>8} {'Kept%':>8}")
+    print(f"  {'-'*20} {'-'*12} {'-'*8} {'-'*8} {'-'*8}")
+    eliminated_folders = []
+    for folder, stats in sorted(folder_stats.items()):
+        cls = "Benign" if stats["label_int"] == 0 else "Malignant"
+        nb, na = stats["n_before"], stats["n_after"]
+        pct = (na / nb * 100) if nb > 0 else 0.0
+        marker = "  *** 0% RETAINED ***" if nb > 0 and na == 0 else ""
+        print(f"  {folder:<20} {cls:<12} {nb:>8} {na:>8} {pct:>7.1f}%{marker}")
+        if nb > 0 and na == 0:
+            eliminated_folders.append(folder)
+
+    if eliminated_folders:
+        raise ValueError(
+            f"\n  [CRITICAL] Fallback aspect-ratio heuristic fully eliminated: {eliminated_folders}\n"
+            f"  Pipeline halted to prevent degraded 24-malignant cohort.\n"
+            f"  Place official Metadata.csv at: {k_root / 'Metadata.csv'} and re-run."
+        )
 
     df = pd.DataFrame(records)
     if df.empty:
