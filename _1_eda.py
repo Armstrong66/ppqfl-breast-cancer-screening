@@ -94,15 +94,27 @@ def find_kau_root() -> Path:
         f"  Server paths:\n    " + "\n    ".join(str(p) for p in server_paths)
     )
 
+def _looks_like_kau_metadata(path: Path) -> bool:
+    """Validate that candidate CSV contains expected KAU-BCMD columns."""
+    try:
+        df_head = pd.read_csv(path, nrows=2)
+        cols = {str(c).strip().lower() for c in df_head.columns}
+        has_assessment = any(c in {"assessment", "birads", "bi-rads", "birad", "class", "grade"} for c in cols)
+        has_path = any("path" in c or "file" in c for c in cols)
+        return has_assessment and has_path
+    except Exception:
+        return False
+
+
 def find_kau_metadata(kau_root: Path) -> Optional[Path]:
     """
     Search for the official KAU-BCMD Metadata.csv.
 
-    Strategy (in order):
-    1. Direct candidate paths (kau_root, parent, known server paths).
-    2. Recursive rglob from kau_root and up to 3 parent directories.
-    3. Known Kaggle/data download trees on the Linux server.
-    4. Glob for any *metadata*.csv variant in all of the above.
+    Strategy:
+    1. Check direct candidate paths inside kau_root or explicitly dedicated KAU paths.
+    2. Search strictly inside kau_root via rglob.
+    3. Validate any match using _looks_like_kau_metadata() to prevent picking up
+       unrelated metadata files (e.g., from other projects).
     """
     # --- 1. Direct candidates ---
     direct = [
@@ -111,52 +123,32 @@ def find_kau_metadata(kau_root: Path) -> Optional[Path]:
         kau_root.parent / "Metadata.csv",
         kau_root.parent / "metadata.csv",
         Path("/data/derrick/kau/Metadata.csv"),
-        Path("/data/derrick/Metadata.csv"),
+        Path("/data/derrick/kau/metadata.csv"),
         Path("./kau/Metadata.csv"),
         Path("../kau/Metadata.csv"),
     ]
     for cp in direct:
-        if cp.exists() and cp.is_file():
-            print(f"  [KAU Metadata] Found: {cp}")
+        if cp.exists() and cp.is_file() and _looks_like_kau_metadata(cp):
+            print(f"  [KAU Metadata] Found and verified: {cp.resolve()}")
             return cp.resolve()
 
-    # --- 2. Recursive search up the directory tree (up to 3 levels up) ---
-    search_roots = [kau_root]
-    p = kau_root.parent
-    for _ in range(3):
-        search_roots.append(p)
-        p = p.parent
-
-    # --- 3. Known Linux server/Kaggle download paths ---
-    server_roots = [
-        Path("/home/derrick/projects/ppqfl-breast-cancer-screening"),
-        Path("/home/derrick/projects"),
-        Path("/home/derrick"),
-        Path("/data/derrick"),
-        Path("/data"),
-    ]
-    for sr in server_roots:
-        if sr.exists():
-            search_roots.append(sr)
-
-    seen_roots: set = set()
-    for root in search_roots:
-        if not root.exists() or root in seen_roots:
-            continue
-        seen_roots.add(root)
-        # Exact filename first (faster)
+    # --- 2. Search strictly within kau_root ---
+    if kau_root.exists() and kau_root.is_dir():
+        # Exact filename search first
         for name in ["Metadata.csv", "metadata.csv"]:
-            for hit in root.rglob(name):
-                print(f"  [KAU Metadata] Found via rglob: {hit}")
+            for hit in kau_root.rglob(name):
+                if _looks_like_kau_metadata(hit):
+                    print(f"  [KAU Metadata] Found and verified via rglob: {hit.resolve()}")
+                    return hit.resolve()
+        # Wildcard search within kau_root only
+        for hit in kau_root.rglob("*[Mm]etadata*.csv"):
+            if _looks_like_kau_metadata(hit):
+                print(f"  [KAU Metadata] Found and verified via wildcard: {hit.resolve()}")
                 return hit.resolve()
-        # Wildcard variant
-        for hit in root.rglob("*[Mm]etadata*.csv"):
-            print(f"  [KAU Metadata] Found via wildcard: {hit}")
-            return hit.resolve()
 
     print(
-        f"  [KAU Metadata] WARNING: Metadata.csv not found.\n"
-        f"  Searched: {[str(r) for r in list(search_roots)[:6]]}...\n"
+        f"  [KAU Metadata] WARNING: Valid KAU-BCMD Metadata.csv not found.\n"
+        f"  Searched within: {kau_root}\n"
         f"  Manual action required: locate Metadata.csv in the KAU-BCMD release\n"
         f"  and place it at: {kau_root / 'Metadata.csv'}"
     )
