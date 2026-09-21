@@ -404,10 +404,14 @@ def assert_no_format_confound(df_kau: pd.DataFrame, max_allowed_diff: float = 0.
 
     confounds = []
     if "width" in df_kau.columns and "height" in df_kau.columns:
-        for (w, h), group in df_kau.groupby(["width", "height"]):
+        w_col = df_kau["width"].iloc[:, 0] if isinstance(df_kau["width"], pd.DataFrame) else df_kau["width"]
+        h_col = df_kau["height"].iloc[:, 0] if isinstance(df_kau["height"], pd.DataFrame) else df_kau["height"]
+        df_eval = pd.DataFrame({"w": w_col.values, "h": h_col.values, "lbl": df_kau[label_col].values})
+
+        for (w, h), group in df_eval.groupby(["w", "h"]):
             if len(group) < 20:
                 continue
-            cluster_balance = group[label_col].mean()
+            cluster_balance = group["lbl"].mean()
             diff = abs(cluster_balance - overall_balance)
             if diff > max_allowed_diff:
                 confounds.append(

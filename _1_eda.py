@@ -678,10 +678,14 @@ def assert_no_format_confound(df_kau: pd.DataFrame, max_allowed_diff: float = 0.
     # ── Level 2: per-resolution-cluster ───────────────────────────────────────
     confounds = []
     if "width" in df_kau.columns and "height" in df_kau.columns:
-        for (w, h), group in df_kau.groupby(["width", "height"]):
+        w_col = df_kau["width"].iloc[:, 0] if isinstance(df_kau["width"], pd.DataFrame) else df_kau["width"]
+        h_col = df_kau["height"].iloc[:, 0] if isinstance(df_kau["height"], pd.DataFrame) else df_kau["height"]
+        df_eval = pd.DataFrame({"w": w_col.values, "h": h_col.values, "lbl": df_kau[label_col].values})
+
+        for (w, h), group in df_eval.groupby(["w", "h"]):
             if len(group) < 20:
                 continue
-            cluster_balance = group[label_col].mean()
+            cluster_balance = group["lbl"].mean()
             diff = abs(cluster_balance - overall_balance)
             if diff > max_allowed_diff:
                 confounds.append(
@@ -735,7 +739,10 @@ def run_audit(df: pd.DataFrame) -> pd.DataFrame:
     stats = []
     for path in tqdm(df["path"], desc=f"  Auditing {df['dataset'].iloc[0]}"):
         stats.append(audit_image(path))
-    return pd.concat([df.reset_index(drop=True), pd.DataFrame(stats)], axis=1)
+    stats_df = pd.DataFrame(stats)
+    # Drop any pre-existing overlapping columns in df to avoid duplicate column names
+    clean_df = df.drop(columns=[c for c in stats_df.columns if c in df.columns], errors="ignore")
+    return pd.concat([clean_df.reset_index(drop=True), stats_df], axis=1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
