@@ -106,17 +106,69 @@ def _looks_like_kau_metadata(path: Path) -> bool:
         return False
 
 
+def export_kau_xlsx_to_csv(xlsx_path: Path, csv_path: Path) -> bool:
+    """Extract sheet containing image paths & assessments from correctSheetlast.xlsx using standard library."""
+    import zipfile, xml.etree.ElementTree as ET, csv
+    if not xlsx_path.exists():
+        return False
+    try:
+        with zipfile.ZipFile(xlsx_path, 'r') as z:
+            shared_strings = []
+            if 'xl/sharedStrings.xml' in z.namelist():
+                tree = ET.fromstring(z.read('xl/sharedStrings.xml'))
+                for si in tree.findall('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}si'):
+                    texts = [t.text for t in si.iter('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t') if t.text]
+                    shared_strings.append(''.join(texts))
+
+            wb_tree = ET.fromstring(z.read('xl/workbook.xml'))
+            sheets = wb_tree.findall('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheet')
+            target_sheet_file = None
+            for s in sheets:
+                s_name = s.attrib.get('name', '').lower()
+                if 'correctsheet' in s_name:
+                    r_id = s.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+                    rels_tree = ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))
+                    for rel in rels_tree.findall('{http://schemas.openxmlformats.org/package/2006/relationships}Relationship'):
+                        if rel.attrib.get('Id') == r_id:
+                            target_sheet_file = 'xl/' + rel.attrib.get('Target').lstrip('/')
+                            break
+                    if target_sheet_file:
+                        break
+
+            if not target_sheet_file:
+                target_sheet_file = 'xl/worksheets/sheet2.xml' if 'xl/worksheets/sheet2.xml' in z.namelist() else 'xl/worksheets/sheet1.xml'
+
+            st_tree = ET.fromstring(z.read(target_sheet_file))
+            rows_to_export = []
+            for r in st_tree.findall('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row'):
+                row_vals = []
+                for c in r.findall('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c'):
+                    t = c.attrib.get('t')
+                    v = c.find('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v')
+                    val = v.text if v is not None else ''
+                    if t == 's' and val.isdigit():
+                        idx = int(val)
+                        val = shared_strings[idx] if idx < len(shared_strings) else val
+                    row_vals.append(val)
+                if any(row_vals):
+                    rows_to_export.append(row_vals[:8])
+
+            if rows_to_export:
+                with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerows(rows_to_export)
+                print(f"  [KAU Metadata] Auto-extracted {len(rows_to_export)} records from {xlsx_path.name} -> {csv_path.name}")
+                return True
+    except Exception as e:
+        print(f"  [KAU Metadata] Failed to auto-extract from {xlsx_path}: {e}")
+    return False
+
+
 def find_kau_metadata(kau_root: Path) -> Optional[Path]:
     """
-    Search for the official KAU-BCMD Metadata.csv.
-
-    Strategy:
-    1. Check direct candidate paths inside kau_root or explicitly dedicated KAU paths.
-    2. Search strictly inside kau_root via rglob.
-    3. Validate any match using _looks_like_kau_metadata() to prevent picking up
-       unrelated metadata files (e.g., from other projects).
+    Search for the official KAU-BCMD Metadata.csv, or auto-extract it
+    from correctSheetlast.xlsx if present.
     """
-    # --- 1. Direct candidates ---
     direct = [
         kau_root / "Metadata.csv",
         kau_root / "metadata.csv",
@@ -132,24 +184,34 @@ def find_kau_metadata(kau_root: Path) -> Optional[Path]:
             print(f"  [KAU Metadata] Found and verified: {cp.resolve()}")
             return cp.resolve()
 
-    # --- 2. Search strictly within kau_root ---
+    # Search strictly within kau_root
     if kau_root.exists() and kau_root.is_dir():
-        # Exact filename search first
         for name in ["Metadata.csv", "metadata.csv"]:
             for hit in kau_root.rglob(name):
                 if _looks_like_kau_metadata(hit):
                     print(f"  [KAU Metadata] Found and verified via rglob: {hit.resolve()}")
                     return hit.resolve()
-        # Wildcard search within kau_root only
         for hit in kau_root.rglob("*[Mm]etadata*.csv"):
             if _looks_like_kau_metadata(hit):
                 print(f"  [KAU Metadata] Found and verified via wildcard: {hit.resolve()}")
                 return hit.resolve()
 
+    # Auto-extract from correctSheetlast.xlsx if available
+    xlsx_candidates = [
+        kau_root / "correctSheetlast.xlsx",
+        kau_root.parent / "correctSheetlast.xlsx",
+        Path("/data/derrick/kau/correctSheetlast.xlsx"),
+    ]
+    for x in xlsx_candidates:
+        if x.exists() and x.is_file():
+            target_csv = x.parent / "Metadata.csv"
+            if export_kau_xlsx_to_csv(x, target_csv) and _looks_like_kau_metadata(target_csv):
+                return target_csv.resolve()
+
     print(
         f"  [KAU Metadata] WARNING: Valid KAU-BCMD Metadata.csv not found.\n"
         f"  Searched within: {kau_root}\n"
-        f"  Manual action required: locate Metadata.csv in the KAU-BCMD release\n"
+        f"  Manual action required: locate correctSheetlast.xlsx or Metadata.csv in the KAU-BCMD release\n"
         f"  and place it at: {kau_root / 'Metadata.csv'}"
     )
     return None
@@ -300,8 +362,8 @@ def collect_kau_paths_from_metadata(metadata_csv: Path, kau_root: Path,
                                     dataset_name: str = "KAU-BCMD") -> pd.DataFrame:
     """
     Ingest KAU-BCMD strictly from the official Metadata.csv.
-    Every row's image path is verified on disk. Non-primary content (masks,
-    reports, composite sheets) is filtered out systematically.
+    Every row's image path is verified on disk via stem and path index.
+    Non-primary content (masks, reports, segmentations) is filtered out systematically.
     BI-RADS mapping: 1, 2, 3 -> Benign (0); 4, 5 -> Malignant (1).
     """
     print(f"  [KAU Ingestion] Using official metadata: {metadata_csv}")
@@ -309,7 +371,7 @@ def collect_kau_paths_from_metadata(metadata_csv: Path, kau_root: Path,
     col_map = {c.strip().lower(): c for c in meta.columns}
 
     assess_col = None
-    for cand in ["assessment", "birads", "bi-rads", "birad", "class", "grade"]:
+    for cand in ["assessment", "assesment", "birads", "bi-rads", "birad", "class", "grade"]:
         if cand in col_map:
             assess_col = col_map[cand]
             break
@@ -324,11 +386,16 @@ def collect_kau_paths_from_metadata(metadata_csv: Path, kau_root: Path,
     if path_col is None:
         raise ValueError(f"Could not find Images Path column in {metadata_csv}. Columns: {list(meta.columns)}")
 
+    # Pre-index all image files under kau_root by stem for fast, robust cross-format lookup
+    file_index: Dict[str, Path] = {}
+    for p in kau_root.rglob("*"):
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXT:
+            file_index[p.stem.strip().lower()] = p
+
     label_names = {0: "Benign", 1: "Malignant"}
     birad_to_label = {1: 0, 2: 0, 3: 0, 4: 1, 5: 1}
 
     records = []
-    skipped_aspect = 0
     skipped_masks = 0
     skipped_missing = 0
 
@@ -348,22 +415,17 @@ def collect_kau_paths_from_metadata(metadata_csv: Path, kau_root: Path,
             continue
         label_int = birad_to_label[grade]
 
-        rel_p = str(row[path_col]).replace("\\", "/")
-        candidate_file = None
-        for candidate in [
-            kau_root / rel_p,
-            kau_root.parent / rel_p,
-            Path(rel_p),
-        ]:
-            if candidate.exists() and candidate.is_file():
-                candidate_file = candidate
-                break
+        raw_p = str(row[path_col]).strip()
+        stem = Path(raw_p).stem.strip().lower()
 
+        candidate_file = file_index.get(stem)
         if candidate_file is None:
-            fname = Path(rel_p).name
-            matches = list(kau_root.glob(f"**/{fname}"))
-            if matches:
-                candidate_file = matches[0]
+            # Fallback direct path check
+            rel_p = raw_p.replace("\\", "/")
+            for direct in [kau_root / rel_p, kau_root.parent / rel_p, Path(rel_p)]:
+                if direct.exists() and direct.is_file():
+                    candidate_file = direct
+                    break
 
         if candidate_file is None:
             skipped_missing += 1
