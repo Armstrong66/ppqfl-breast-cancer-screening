@@ -99,7 +99,7 @@ def _looks_like_kau_metadata(path: Path) -> bool:
     try:
         df_head = pd.read_csv(path, nrows=2)
         cols = {str(c).strip().lower() for c in df_head.columns}
-        has_assessment = any(c in {"assessment", "birads", "bi-rads", "birad", "class", "grade"} for c in cols)
+        has_assessment = any(c in {"assessment", "assesment", "birads", "bi-rads", "birad", "class", "grade"} for c in cols)
         has_path = any("path" in c or "file" in c for c in cols)
         return has_assessment and has_path
     except Exception:
