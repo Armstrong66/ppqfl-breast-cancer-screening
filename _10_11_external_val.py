@@ -840,20 +840,38 @@ def build_master_ablation(
     rows = []
     matched_kau_keys = set()
 
-    def find_kau_entry(model_name: str = "", nq: Optional[int] = None, nl: Optional[int] = None) -> dict:
+    def find_kau_entry(model_name: str = "", nq: Optional[int] = None, nl: Optional[int] = None,
+                       regime_b: bool = False) -> dict:
         if not kau_results_dict:
             return {}
         if model_name in kau_results_dict:
             matched_kau_keys.add(model_name)
             return kau_results_dict[model_name]
-        
+
+        # Bug fix (Inconsistency 2, part A): param-matched classical controls were trained
+        # only on Mendeley and were never evaluated on KAU. They must NOT fall through to
+        # the "classical" fuzzy-match branch, which would return MobileNetV2's KAU numbers.
+        m_lower = model_name.lower()
+        if "param-matched" in m_lower or "classical mlp match" in m_lower:
+            return {}
+
         if nq is not None and nl is not None:
             for k, v in kau_results_dict.items():
-                if f"q={nq}" in k and f"l={nl}" in k and "regime b" not in k.lower():
-                    matched_kau_keys.add(k)
-                    return v
-        
-        m_lower = model_name.lower()
+                k_lower = k.lower()
+                has_regime_b = "regime b" in k_lower
+                if regime_b:
+                    # Bug fix (Inconsistency 2, part B): Regime B lookup must only match
+                    # keys that explicitly contain "regime b" so q=4 l=2 Regime B
+                    # does not steal its Regime A counterpart's KAU result.
+                    if f"q={nq}" in k and f"l={nl}" in k and has_regime_b:
+                        matched_kau_keys.add(k)
+                        return v
+                else:
+                    # Regime A / sweep: must NOT match a Regime B key
+                    if f"q={nq}" in k and f"l={nl}" in k and not has_regime_b:
+                        matched_kau_keys.add(k)
+                        return v
+
         if "classical" in m_lower and "control" not in m_lower and "micro" not in m_lower:
             for k, v in kau_results_dict.items():
                 if "classical" in k.lower() and "micro" not in k.lower():
@@ -874,7 +892,7 @@ def build_master_ablation(
                 if "qfl" in k.lower() or "federated" in k.lower():
                     matched_kau_keys.add(k)
                     return v
-        
+
         return {}
 
     # ── 1. Classical baseline ─────────────────────────────────────────────
@@ -1020,7 +1038,7 @@ def build_master_ablation(
         df_h  = pd.read_csv(hist_csv)
         best_auc = df_h["val_auc"].max() if "val_auc" in df_h.columns else "N/A"
         label = f"HQCNN q={nq} l={nl} (Regime B)"
-        b_entry = find_kau_entry(label, nq=nq, nl=nl)
+        b_entry = find_kau_entry(label, nq=nq, nl=nl, regime_b=True)
         rows.append({
             "Model":           label,
             "ModelShort":      f"VQC-q{nq}l{nl}-B",
@@ -1116,7 +1134,7 @@ def build_master_ablation(
             "Model":           "QFL (σ_dp=0, no DP)",
             "ModelShort":      "QFL",
             "Category":        "QFL Federated",
-            "Regime":          "federated (FedAvg, 3 Ghanaian clients)",
+            "Regime":          "federated (FedAvg, 3 simulated clients)",
             "Qubits":          N_QUBITS, "Layers": N_LAYERS,
             "TrainableParams": N_QUBITS * N_LAYERS + 1,
             "NoiseSigma":      0.0, "DPSigma": 0.0,
