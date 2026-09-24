@@ -10,8 +10,8 @@
 ## Overview
 This project implements a hybrid quantum-classical neural network (HQCNN)
 within a simulated Quantum Federated Learning (QFL) framework for
-privacy-preserving breast cancer screening. Three virtual Ghanaian hospital
-clients (Accra, Kumasi, Tamale) train locally; only VQC parameters are
+privacy-preserving breast cancer screening. Three virtual clinical tier
+clients (Tier 1, Tier 2, Tier 3) train locally; only VQC parameters are
 aggregated — raw patient data never leaves any node.
 
 ## Key contributions
@@ -136,7 +136,7 @@ CACHE.reset()        # reset all
 | MobileNetV2 (classical) | 164,226 | 0.9858 | Progressive unfreeze |
 | HQCNN Regime A (q=4, l=2) | **9** | 0.9631 | Frozen backbone + VQC |
 | HQCNN Regime B (q=4, l=2) | 29 | 0.9827 | End-to-end projection + VQC |
-| QFL (3 clients, no DP) | 9 | ~0.96 | Simulated Ghanaian hospitals |
+| QFL (3 clients, no DP) | 9 | ~0.96 | Multi-client federation (FedAvg) |
 
 Classical ECE: 0.047 · Quantum ECE (raw): 0.223 · Quantum ECE (post-scaling): see `uq_outputs/uq_summary.json`
 
